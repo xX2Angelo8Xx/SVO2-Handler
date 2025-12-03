@@ -135,9 +135,9 @@ class TrainingConfig:
         if not self.source_training_root.exists():
             raise ValueError(f"Source training root does not exist: {self.source_training_root}")
         
-        # Validate image size
-        if self.image_size not in [416, 512, 640, 1280]:
-            raise ValueError(f"Image size must be one of [416, 512, 640, 1280], got {self.image_size}")
+        # Validate image size (-1 means use source resolution)
+        if self.image_size != -1 and self.image_size not in [416, 512, 640, 800, 1024, 1280]:
+            raise ValueError(f"Image size must be -1 (source) or one of [416, 512, 640, 800, 1024, 1280], got {self.image_size}")
         
         # Validate epochs
         if self.epochs <= 0:

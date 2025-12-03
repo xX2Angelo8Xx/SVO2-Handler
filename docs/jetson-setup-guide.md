@@ -2,35 +2,77 @@
 
 **Target Hardware**: NVIDIA Jetson Orin Nano Super  
 **JetPack Version**: 6.0 (L4T R36.4.4)  
-**Last Updated**: December 3, 2025
+**Last Updated**: December 4, 2025  
+**⚠️ WARNING**: Training on Jetson NOT recommended - see [Training Feasibility](#training-feasibility) below
 
 ---
 
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [System Requirements](#system-requirements)
-3. [PyTorch Installation](#pytorch-installation)
-4. [cuDNN Installation](#cudnn-installation)
-5. [Verification](#verification)
-6. [Troubleshooting](#troubleshooting)
-7. [Performance Benchmarks](#performance-benchmarks)
+2. [Training Feasibility](#training-feasibility) ⚠️ **READ THIS FIRST**
+3. [System Requirements](#system-requirements)
+4. [PyTorch Installation](#pytorch-installation)
+5. [cuDNN Installation](#cudnn-installation)
+6. [Verification](#verification)
+7. [Troubleshooting](#troubleshooting)
+8. [Performance Benchmarks](#performance-benchmarks)
 
 ---
 
 ## Overview
 
-This guide provides step-by-step instructions for setting up PyTorch with CUDA support on Jetson Orin Nano Super for YOLO training. The default PyTorch from PyPI is **CPU-only** and will result in 150x slower training (50 hours vs. 2-3 hours for 100 epochs).
+This guide provides step-by-step instructions for setting up PyTorch with CUDA support on Jetson Orin Nano Super. Originally intended for YOLO training, field testing revealed significant limitations.
 
-### Critical Issue
+**⚠️ IMPORTANT**: After extensive testing, **YOLO training on Jetson Orin Nano 8GB is NOT feasible** due to memory constraints. This guide is preserved for:
+- SVO2 extraction and preprocessing (works great)
+- Annotation workflows (works great)
+- **Future inference deployment** (after training on PC)
 
-**DO NOT** install PyTorch from standard PyPI:
-```bash
-# ❌ WRONG - This installs CPU-only version
-pip install torch torchvision
-```
+For YOLO training, use a PC with dedicated GPU (RTX 2060 or better).
 
-**ALWAYS** use NVIDIA's pre-built wheels for Jetson.
+---
+
+## Training Feasibility
+
+### ❌ Why Training Failed on Jetson
+
+**Tested Configuration**:
+- Dataset: 612 training images, 168 validation images
+- Model: YOLOv8n (3M parameters)
+- Batch size: 16 → 8 → 4 (all failed)
+- Image size: 640x640
+
+**Memory Breakdown** (8GB total):
+- Base OS + JetPack: ~2GB
+- ZED SDK cached: ~1GB
+- PyTorch + model: ~1.5GB
+- Dataset caching: ~1-2GB
+- Training buffers: ~2-3GB
+- **Total required**: >8GB → **OOM kill during first epoch**
+
+**Issues Encountered**:
+1. **Out of Memory kills**: Process killed during dataset initialization
+2. **cuDNN incompatibility**: PyTorch 2.3 (cuDNN 8) vs JetPack 6.0 (cuDNN 9)
+3. **Complex installation**: Non-standard PyTorch wheels from NVIDIA
+4. **Performance**: Only 1024 CUDA cores (vs 1920 on RTX 2060)
+
+### ✅ Recommended Workflow
+
+**Use Jetson For** (works great):
+- SVO2 file extraction from ZED camera
+- Frame export and preprocessing
+- Annotation (Viewer/Annotator app)
+- Verification (Annotation Checker app)
+- **Inference deployment** (with TensorRT optimization)
+
+**Use PC For** (training):
+- YOLO model training
+- Model experimentation
+- Hyperparameter tuning
+- Standard PyTorch installation (no special wheels needed)
+
+See [fieldtest-learnings.md](./fieldtest-learnings.md#yolo-training-attempts-on-jetson-orin-nano) for complete analysis.
 
 ---
 
@@ -39,6 +81,9 @@ pip install torch torchvision
 ### Hardware
 - **Device**: Jetson Orin Nano Super
 - **RAM**: 8GB (shared with GPU)
+  - **Training**: Insufficient for YOLO ❌
+  - **Inference**: Sufficient with TensorRT ✅
+  - **Extraction/Annotation**: Sufficient ✅
 - **Storage**: 64GB+ (for datasets and models)
 - **Power**: 15W power supply recommended
 
@@ -47,6 +92,8 @@ pip install torch torchvision
 - **Python**: 3.10.x
 - **CUDA**: 12.2 (included with JetPack)
 - **cuDNN**: 8.9.7 or later (for PyTorch 2.3)
+
+**Note**: PyTorch installation instructions below are preserved for reference and future inference deployment.
 
 ### Check Your System
 

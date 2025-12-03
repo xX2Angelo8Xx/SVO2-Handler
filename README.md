@@ -94,10 +94,30 @@ pip install -r requirements.txt
 # For x86_64, install from ZED SDK
 ```
 
-**⚠️ CRITICAL FOR JETSON USERS:**  
-If training on Jetson, you **MUST** install PyTorch with CUDA support. The default `pip install torch` installs CPU-only version (150x slower).
+**⚠️ IMPORTANT - Recommended Hardware Setup:**
 
-**See**: [`docs/jetson-setup-guide.md`](docs/jetson-setup-guide.md) for complete CUDA setup instructions.
+**Training** (PC with dedicated GPU recommended):
+- Desktop/laptop with NVIDIA RTX 2060+ (6GB+ VRAM)
+- Standard PyTorch installation (no special wheels needed)
+- Sufficient memory for batch training (16-32GB RAM)
+- **Expected**: 1-2 hours for 100 epochs @ 640x640
+- **See**: [`docs/pc-setup-guide.md`](docs/pc-setup-guide.md) for PC setup
+
+**Jetson Training NOT Feasible**:
+- Jetson Orin Nano 8GB runs out of memory during training
+- cuDNN compatibility issues require workarounds
+- Complex PyTorch installation with custom wheels
+- **Conclusion**: Use Jetson for extraction/annotation/inference only
+- **See**: [`docs/jetson-setup-guide.md`](docs/jetson-setup-guide.md) for limitations and [`docs/fieldtest-learnings.md`](docs/fieldtest-learnings.md) for detailed analysis
+
+**Recommended Workflow**:
+```
+Jetson: SVO2 Capture → Frame Export → Annotation
+   ↓ (transfer dataset)
+PC: YOLO Training (1-2 hours)
+   ↓ (transfer model)
+Jetson: TensorRT Inference → Drone Deployment
+```
 
 ### Basic Workflow
 ```bash
@@ -172,13 +192,19 @@ scripts/                # Automation helpers
 
 ## Documentation
 
-- **[Jetson Setup Guide](docs/jetson-setup-guide.md)** – **CRITICAL!** PyTorch + CUDA installation for Jetson (required for training)
-- **[Training Feature Guide](docs/training-guide.md)** – Comprehensive guide to Training GUI with Jetson recommendations
-- **[Application Guides](docs/applications.md)** – Detailed feature documentation for all four apps
-- **[Architecture](docs/architecture.md)** – System design and implementation details
-- **[YOLO Training Structure](docs/yolo-training-structure.md)** – Bucket organization and conventions
+### Setup Guides
+- **[PC Setup Guide](docs/pc-setup-guide.md)** – **RECOMMENDED FOR TRAINING!** PyTorch + CUDA setup for desktop/laptop with NVIDIA GPU
+- **[Jetson Setup Guide](docs/jetson-setup-guide.md)** – PyTorch installation for Jetson (extraction/annotation/inference only, training not feasible)
+
+### Feature Guides
+- **[Training Feature Guide](docs/training-guide.md)** – Comprehensive Training GUI guide with hardware recommendations
+- **[Application Guides](docs/applications.md)** – Detailed documentation for all four apps
+- **[YOLO Training Structure](docs/yolo-training-structure.md)** – 73-bucket organization and filename conventions
+
+### Technical Documentation
+- **[Architecture](docs/architecture.md)** – System design and implementation
 - **[Coding Guidelines](docs/coding-guidelines.md)** – Development standards
-- **[Field Test Learnings](docs/fieldtest-learnings.md)** – Capture stack insights
+- **[Field Test Learnings](docs/fieldtest-learnings.md)** – Jetson training analysis and workflow recommendations
 
 ## Technology Stack
 

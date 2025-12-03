@@ -16,3 +16,5 @@ NameError: name 't_browse_btn' is not definedPySide6>=6.6
 opencv-contrib-python>=4.9.0
 numpy>=1.24.0
 Pillow>=9.0
+ultralytics>=8.0.0
+PyYAML>=6.0

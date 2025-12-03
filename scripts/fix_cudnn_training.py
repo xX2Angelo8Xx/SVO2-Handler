@@ -27,18 +27,16 @@ os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 
 import torch
 
-# Disable cuDNN benchmarking in PyTorch
-torch.backends.cudnn.benchmark = False
-torch.backends.cudnn.deterministic = False
+# Disable cuDNN completely to avoid execution failures
+torch.backends.cudnn.enabled = False
 
 # Allow TF32 for better performance on Ampere
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
 
-print("✅ cuDNN compatibility settings applied")
-print(f"   - cudnn.benchmark: {torch.backends.cudnn.benchmark}")
-print(f"   - cudnn.deterministic: {torch.backends.cudnn.deterministic}")
-print(f"   - CUDA TF32: {torch.backends.cuda.matmul.allow_tf32}")
+print("✅ cuDNN completely disabled (using PyTorch CUDA fallback)")
+print(f"   - cudnn.enabled: {torch.backends.cudnn.enabled}")
+print(f"   - CUDA TF32: {torch.backends.cuda.matmul.allow_tf32 if torch.cuda.is_available() else 'N/A'}")
 
 if __name__ == "__main__":
     print("\n🚀 Launching training app with cuDNN workarounds...")

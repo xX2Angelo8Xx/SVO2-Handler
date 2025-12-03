@@ -29,18 +29,18 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-# Apply cuDNN workarounds for Jetson compatibility
+# Disable cuDNN completely for Jetson compatibility
+# cuDNN 8/9 version mismatch causes EXECUTION_FAILED errors
+# Disabling cuDNN uses PyTorch's native CUDA kernels (slower but reliable)
 os.environ.setdefault('PYTORCH_CUDNN_BENCHMARK', '0')
 
 from PySide6 import QtWidgets
 
-# Import torch to apply backend settings
+# Import torch to disable cuDNN completely
 import torch
-torch.backends.cudnn.benchmark = False
-torch.backends.cudnn.deterministic = False
+torch.backends.cudnn.enabled = False  # CRITICAL: Disable cuDNN, use PyTorch CUDA fallback
 if torch.cuda.is_available():
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = True  # Keep TF32 for Ampere GPU performance
 
 from .training_config import TrainingConfig, get_augmentation_preset
 from .training_worker import TrainingWorker

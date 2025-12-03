@@ -3,7 +3,21 @@
 This application provides a graphical interface for training YOLO models
 on the 73-bucket dataset structure. Features include:
 - Dataset formatting and preparation
-- Model selection and configuration
+- Model selection and confi        # Image size
+        self.image_size_combo = QtWidgets.QComboBox()
+        self.image_size_combo.addItems(["416", "512", "640", "800", "1024", "1280"])
+        self.image_size_combo.setCurrentText("640")
+        layout.addRow("Image Size:", self.image_size_combo)
+        
+        # Use source resolution
+        self.use_source_resolution_check = QtWidgets.QCheckBox(
+            "Use Source Resolution (train at native camera resolution, e.g., 1280x720)"
+        )
+        self.use_source_resolution_check.setChecked(False)
+        self.use_source_resolution_check.toggled.connect(self._on_source_resolution_toggled)
+        layout.addRow(self.use_source_resolution_check)
+        
+        # Batch sizen
 - Real-time training progress monitoring
 - Training controls (start/pause/cancel)
 - Metrics visualization
@@ -355,6 +369,17 @@ class TrainingApp(QtWidgets.QMainWindow):
         self.pause_btn.clicked.connect(self._pause_training)
         self.cancel_btn.clicked.connect(self._cancel_training)
     
+    def _on_source_resolution_toggled(self, checked: bool) -> None:
+        """Handle source resolution checkbox toggle."""
+        # Disable image size combo when using source resolution
+        self.image_size_combo.setEnabled(not checked)
+        if checked:
+            self.image_size_combo.setToolTip(
+                "Disabled: Using source resolution from dataset images"
+            )
+        else:
+            self.image_size_combo.setToolTip("")
+    
     def _browse_source_folder(self) -> None:
         """Browse for source training folder."""
         folder = QtWidgets.QFileDialog.getExistingDirectory(
@@ -429,7 +454,7 @@ class TrainingApp(QtWidgets.QMainWindow):
             resume_checkpoint=resume,
             
             # Training
-            image_size=int(self.image_size_combo.currentText()),
+            image_size=int(self.image_size_combo.currentText()) if not self.use_source_resolution_check.isChecked() else -1,
             batch_size=self.batch_size_spin.value(),
             epochs=self.epochs_spin.value(),
             learning_rate=self.lr_spin.value(),

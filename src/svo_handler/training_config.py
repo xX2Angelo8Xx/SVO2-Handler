@@ -156,7 +156,6 @@ class TrainingConfig:
         args = {
             # Data
             "data": str(self.output_dataset_root / "data.yaml"),
-            "imgsz": self.image_size,
             
             # Model
             "model": self._get_model_path(),
@@ -202,6 +201,14 @@ class TrainingConfig:
             "cache": self.cache_images,
             "amp": self.amp,
         }
+        
+        # Add image size if not using source resolution (-1 means use native)
+        if self.image_size > 0:
+            args["imgsz"] = self.image_size
+        else:
+            # Source resolution: Let YOLO determine from images
+            # Note: All images in dataset should have same resolution
+            pass
         
         # Add resume if specified
         if self.resume_checkpoint:

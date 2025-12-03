@@ -48,6 +48,13 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+
+# Large binary files (PyTorch/cuDNN installation artifacts)
+*.whl
+*.tar.xz
+cudnn-linux-sbsa-*/
+torch-*.whl
+torchvision-*.whl
 .dmypy.json
 dmypy.json
 

@@ -94,6 +94,11 @@ pip install -r requirements.txt
 # For x86_64, install from ZED SDK
 ```
 
+**⚠️ CRITICAL FOR JETSON USERS:**  
+If training on Jetson, you **MUST** install PyTorch with CUDA support. The default `pip install torch` installs CPU-only version (150x slower).
+
+**See**: [`docs/jetson-setup-guide.md`](docs/jetson-setup-guide.md) for complete CUDA setup instructions.
+
 ### Basic Workflow
 ```bash
 # 1. Extract frames from SVO2
@@ -167,8 +172,9 @@ scripts/                # Automation helpers
 
 ## Documentation
 
-- **[Training Feature Guide](docs/training-guide.md)** – **NEW!** Comprehensive guide to Training GUI with Jetson recommendations
-- **[Application Guides](docs/applications.md)** – Detailed feature documentation for all three apps
+- **[Jetson Setup Guide](docs/jetson-setup-guide.md)** – **CRITICAL!** PyTorch + CUDA installation for Jetson (required for training)
+- **[Training Feature Guide](docs/training-guide.md)** – Comprehensive guide to Training GUI with Jetson recommendations
+- **[Application Guides](docs/applications.md)** – Detailed feature documentation for all four apps
 - **[Architecture](docs/architecture.md)** – System design and implementation details
 - **[YOLO Training Structure](docs/yolo-training-structure.md)** – Bucket organization and conventions
 - **[Coding Guidelines](docs/coding-guidelines.md)** – Development standards

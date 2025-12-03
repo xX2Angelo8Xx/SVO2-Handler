@@ -240,8 +240,9 @@ class TrainingApp(QtWidgets.QMainWindow):
         
         # Image size
         self.image_size_combo = QtWidgets.QComboBox()
-        self.image_size_combo.addItems(["416", "512", "640", "1280"])
+        self.image_size_combo.addItems(["Source", "416", "512", "640", "800", "1024", "1280"])
         self.image_size_combo.setCurrentText("640")
+        self.image_size_combo.currentTextChanged.connect(self._on_image_size_changed)
         layout.addRow("Image Size:", self.image_size_combo)
         
         # Batch size
@@ -371,14 +372,25 @@ class TrainingApp(QtWidgets.QMainWindow):
     
     def _on_source_resolution_toggled(self, checked: bool) -> None:
         """Handle source resolution checkbox toggle."""
-        # Disable image size combo when using source resolution
-        self.image_size_combo.setEnabled(not checked)
-        if checked:
-            self.image_size_combo.setToolTip(
-                "Disabled: Using source resolution from dataset images"
-            )
+        # Sync dropdown to "Source" when checkbox is enabled
+        if checked and self.image_size_combo.currentText() != "Source":
+            self.image_size_combo.blockSignals(True)
+            self.image_size_combo.setCurrentText("Source")
+            self.image_size_combo.blockSignals(False)
+    
+    def _on_image_size_changed(self, text: str) -> None:
+        """Handle image size dropdown change."""
+        # Sync checkbox when "Source" is selected
+        if text == "Source":
+            if not self.use_source_resolution_check.isChecked():
+                self.use_source_resolution_check.blockSignals(True)
+                self.use_source_resolution_check.setChecked(True)
+                self.use_source_resolution_check.blockSignals(False)
         else:
-            self.image_size_combo.setToolTip("")
+            if self.use_source_resolution_check.isChecked():
+                self.use_source_resolution_check.blockSignals(True)
+                self.use_source_resolution_check.setChecked(False)
+                self.use_source_resolution_check.blockSignals(False)
     
     def _browse_source_folder(self) -> None:
         """Browse for source training folder."""
@@ -454,7 +466,7 @@ class TrainingApp(QtWidgets.QMainWindow):
             resume_checkpoint=resume,
             
             # Training
-            image_size=int(self.image_size_combo.currentText()) if not self.use_source_resolution_check.isChecked() else -1,
+            image_size=-1 if self.image_size_combo.currentText() == "Source" else int(self.image_size_combo.currentText()),
             batch_size=self.batch_size_spin.value(),
             epochs=self.epochs_spin.value(),
             learning_rate=self.lr_spin.value(),

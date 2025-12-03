@@ -9,6 +9,7 @@ This toolkit processes ZED2i camera recordings (`.svo2` files) from Jetson Orin 
 1. **Frame Exporter** – Extract RGB frames and 32-bit depth from SVO2 recordings
 2. **Viewer/Annotator** – Draw bounding boxes, classify targets, export to training buckets
 3. **Annotation Checker** – Verify annotations with zoom and hierarchical navigation
+4. **Training GUI** – Train YOLO models with comprehensive configuration and real-time monitoring
 
 Source `.svo2` files use LOSSLESS mode from field tests. See `docs/fieldtest-learnings.md` for capture stack details.
 
@@ -58,6 +59,30 @@ Verify annotated images with advanced navigation.
 
 **Launch:** `python -m svo_handler.checker_app`
 
+### 4. Training GUI (`training_app.py`)
+Train YOLO models with automated dataset preparation and monitoring.
+
+**Features:**
+- Converts 73-bucket structure to YOLO-compatible format (preserves originals)
+- Configurable train/val/test splits with shuffling and random seed
+- Model selection: YOLOv5/v8 with variants (n/s/m/l/x)
+- Comprehensive training parameters: batch size, epochs, learning rate, optimizer
+- Augmentation presets (none/light/moderate/heavy) with individual parameter tuning
+- Pretrained weights support (COCO, from scratch, or custom)
+- Real-time progress monitoring with training logs
+- Automatic data.yaml generation
+- Negative samples integration as background class
+- Resume from checkpoint support
+
+**Recommended Configuration (Jetson Orin Nano Super)**:
+- Model: YOLOv8n (nano variant)
+- Image Size: 416x416
+- Expected Performance: 50-60 FPS with TensorRT FP16
+
+**Launch:** `python -m svo_handler.training_app`
+
+**See:** [`docs/training-guide.md`](docs/training-guide.md) for comprehensive feature guide and Jetson deployment recommendations
+
 ## Quick Start
 
 ### Installation
@@ -86,6 +111,14 @@ python -m svo_handler.viewer_app
 python -m svo_handler.checker_app
 # → Open training root, select direction
 # → Zoom to inspect, navigate with arrow keys
+
+# 4. Train YOLO model
+python -m svo_handler.training_app
+# → Select 73-bucket training folder as source
+# → Configure model (YOLOv8n recommended for Jetson)
+# → Set image size (416 for real-time, 512 for accuracy)
+# → Start training, monitor progress
+# → Export to TensorRT for Jetson deployment
 ```
 
 ## YOLO Training Structure
@@ -108,9 +141,13 @@ src/svo_handler/
 ├── gui_app.py          # Frame Exporter
 ├── viewer_app.py       # Viewer/Annotator  
 ├── checker_app.py      # Annotation Checker
+├── training_app.py     # Training GUI (Phase 3)
 ├── extraction.py       # Frame export worker
 ├── ingestion.py        # SVO2 reader
 ├── training_export.py  # Bucket management
+├── training_config.py  # Training configuration dataclass
+├── training_worker.py  # Background training thread
+├── yolo_formatter.py   # Convert to YOLO format
 ├── options.py          # Export configuration
 ├── export_paths.py     # Path utilities
 └── config.py           # Default settings
@@ -118,6 +155,7 @@ src/svo_handler/
 docs/
 ├── applications.md              # Detailed app guides
 ├── architecture.md              # System design
+├── training-guide.md            # Comprehensive training feature guide
 ├── yolo-training-structure.md   # Training bucket organization
 ├── coding-guidelines.md         # Development conventions
 └── fieldtest-learnings.md       # Field capture insights
@@ -129,6 +167,7 @@ scripts/                # Automation helpers
 
 ## Documentation
 
+- **[Training Feature Guide](docs/training-guide.md)** – **NEW!** Comprehensive guide to Training GUI with Jetson recommendations
 - **[Application Guides](docs/applications.md)** – Detailed feature documentation for all three apps
 - **[Architecture](docs/architecture.md)** – System design and implementation details
 - **[YOLO Training Structure](docs/yolo-training-structure.md)** – Bucket organization and conventions
@@ -143,6 +182,8 @@ scripts/                # Automation helpers
 - **OpenCV 4.12+** (contrib) – CSRT tracking, image processing
 - **NumPy** – Depth array operations
 - **Pillow** – Image manipulation and annotation overlay
+- **Ultralytics** – YOLOv5/v8 training and inference
+- **PyYAML** – YOLO configuration files
 
 ## Key Features
 
@@ -167,6 +208,7 @@ pytest tests/
 python -m svo_handler.gui_app       # Frame Exporter
 python -m svo_handler.viewer_app    # Annotator
 python -m svo_handler.checker_app   # Checker
+python -m svo_handler.training_app  # Training GUI
 ```
 
 ## Configuration

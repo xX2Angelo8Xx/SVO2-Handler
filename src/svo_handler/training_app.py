@@ -24,11 +24,23 @@ on the 73-bucket dataset structure. Features include:
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Optional
 
+# Apply cuDNN workarounds for Jetson compatibility
+os.environ.setdefault('PYTORCH_CUDNN_BENCHMARK', '0')
+
 from PySide6 import QtWidgets
+
+# Import torch to apply backend settings
+import torch
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = False
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 from .training_config import TrainingConfig, get_augmentation_preset
 from .training_worker import TrainingWorker

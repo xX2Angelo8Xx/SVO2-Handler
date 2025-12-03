@@ -323,7 +323,43 @@ sudo ldconfig
 ldconfig -p | grep cudnn
 ```
 
-### Issue 4: Multiple Python Environments
+### Issue 4: cuDNN Training Errors (EXECUTION_FAILED)
+
+**Symptom:**
+```
+CuDNNError: cuDNN error: CUDNN_STATUS_EXECUTION_FAILED
+GET was unable to find an engine to execute this computation
+```
+
+This occurs when cuDNN 8/9 compatibility issues arise during training.
+
+**Solution Option 1 - Disable cuDNN Benchmarking** (Recommended):
+```bash
+# Set environment variables before training
+export PYTORCH_CUDNN_BENCHMARK=0
+export PYTORCH_DETERMINISTIC=0
+
+# Then launch training
+python -m svo_handler.training_app
+```
+
+**Solution Option 2 - Use Workaround Script**:
+```bash
+python scripts/fix_cudnn_training.py
+```
+
+**Solution Option 3 - Modify Code** (add to training script):
+```python
+import torch
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = False
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+```
+
+**Performance Impact**: Minimal (~5-10% slower) but training will work reliably.
+
+### Issue 5: Multiple Python Environments
 
 **Symptom:**
 - PyTorch works in one terminal but not another

@@ -1,0 +1,18 @@
+angelo@AeroLock:~/Projects/SVO2-Handler$ python -m svo_handler.viewer_app
+Traceback (most recent call last):
+  File "/usr/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/usr/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/angelo/Projects/SVO2-Handler/src/svo_handler/viewer_app.py", line 525, in <module>
+    run()
+  File "/home/angelo/Projects/SVO2-Handler/src/svo_handler/viewer_app.py", line 519, in run
+    window = ViewerWindow()
+  File "/home/angelo/Projects/SVO2-Handler/src/svo_handler/viewer_app.py", line 87, in __init__
+    self._wire_signals()
+  File "/home/angelo/Projects/SVO2-Handler/src/svo_handler/viewer_app.py", line 201, in _wire_signals
+    t_browse_btn.clicked.connect(self._choose_training_root)
+NameError: name 't_browse_btn' is not definedPySide6>=6.6
+opencv-contrib-python>=4.9.0
+numpy>=1.24.0
+Pillow>=9.0

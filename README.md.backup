@@ -1,0 +1,26 @@
+# SVO2 Handler
+
+Desktop tool for extracting RGB frames and raw 32-bit depth from ZED `.svo2` recordings. The app will offer a GUI to choose left or right camera stream, set output FPS (with awareness of the source FPS), and optionally export depth using a selected ZED depth model. Outputs are geared toward training datasets (e.g., custom object detection) from ZED2i captures. Source `.svo2` files originate from the Drone Field Test stack (Jetson Orin Nano + ZED2i, LOSSLESS mode); key upstream learnings are summarized in `docs/fieldtest-learnings.md`.
+
+## Goals
+- Easy, GUI-driven extraction of frames and depth from SVO2 files.
+- Respect original capture metadata (e.g., source FPS) and allow downsampling via slider.
+- Support both RGB streams (left/right) and raw 32-bit depth exports with model selection.
+- Provide a clean, testable architecture to extend with additional preprocessing (resizing, cropping, color conversions).
+
+## Project layout
+- `src/` — application code (GUI, SVO ingestion, extraction pipelines).
+- `docs/` — architecture notes, coding standards, and usage docs.
+- `config/` — app and pipeline configuration templates (e.g., default paths, export profiles).
+- `scripts/` — helper scripts for automation (e.g., dataset prep, packaging).
+- `tests/` — unit/integration tests.
+- `samples/` — example SVO2 files or metadata snippets (no large binaries committed).
+
+## Quick start (planned)
+1) Install Python 3.10+ with the ZED SDK available on the system.  
+2) Create and activate a virtual environment.  
+3) Install dependencies (`pip install -r requirements.txt`).  
+4) Run the GUI entry point `python -m svo_handler.gui_app`.  
+5) Point the app to an `.svo2` file and choose stream, FPS, and depth options. Frame export writes full-resolution frames (no downscaling) to `/media/angelo/DRONE_DATA/SVO2_Frame_Export/<source_parent>_RAW_<svo_name>/` and shows the last exported frame in the preview pane.
+
+See `docs/architecture.md` for the planned design and `docs/coding-guidelines.md` for conventions.

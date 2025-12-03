@@ -1,0 +1,56 @@
+# Architecture Overview
+
+## Scope
+GUI-driven SVO2 extraction tool for ZED2i recordings. Users pick an `.svo2` file, choose left/right stream, set output FPS (with awareness of the original capture FPS), and optionally export raw 32-bit depth using a selected depth model. Outputs target dataset creation for training computer vision models. Upstream capture stack details (Jetson Orin Nano + ZED2i, LOSSLESS-only) and field lessons are summarized in `docs/fieldtest-learnings.md`.
+
+## Assumptions
+- Python 3.10+ environment.
+- ZED SDK installed locally (for `.svo2` decoding and depth access).
+- Local, desktop-first GUI (PySide6/Qt). Headless/CLI mode can be added later for automation.
+- Outputs written to user-selected directories; no bundled sample binaries in the repo.
+
+## Proposed modules
+- **UI (PySide6)**: Main window, file picker, stream selection (left/right), FPS slider (shows source FPS), depth model dropdown, progress reporting, and error surface. Emits intents to the application layer.
+- **App/Controller**: Orchestrates user intents, validates options (e.g., target FPS <= source FPS), and coordinates extraction pipelines. Handles long-running tasks with worker threads to keep UI responsive.
+- **Ingestion**: Opens `.svo2`, reads metadata (resolution, original FPS, duration, available depth modes), and exposes frame iterators for RGB and depth.
+- **Extraction Pipelines**: 
+  - RGB extraction: choose stream, downsample via frame skipping, write images (configurable format/quality), optionally store frame index + timestamp manifests.
+  - Depth extraction: choose depth model, export raw 32-bit depth per frame, optional normalization/visualization, same FPS downsampling.
+- **Storage/IO**: Encapsulates writing frames, manifests, and depth arrays to disk; enforces output folder structure and naming.
+- **Config**: Centralized defaults (paths, image format, thread counts, depth model defaults) loaded from `config/` templates.
+- **Logging/Telemetry**: Structured logs for runs (source path, chosen options, errors). Progress updates routed back to UI.
+- **Tests**: Unit tests for option validation, FPS downsampling math, manifest generation; integration tests with small stub `.svo2` clips or mocked ingestion.
+
+## Data flow
+1) User selects `.svo2` in UI.  
+2) Ingestion reads metadata (including source FPS) and surfaces it to UI.  
+3) User configures stream (L/R), target FPS, and optional depth model.  
+4) Controller validates and spins up extraction pipeline workers.  
+5) Pipelines pull frames from ingestion, downsample (skip every `n`), and pass to IO for disk writes.  
+6) UI shows progress and completion summary (frames written, duration, any dropped frames/errors).
+
+## Configuration & outputs
+- Default config templates live in `config/` (JSON/YAML; final format TBD).
+- Suggested output layout when exporting:
+  - `export/session_name/rgb_left/` or `rgb_right/` for images.
+  - `export/session_name/depth_raw/` for 32-bit depth (e.g., `.npy` or `.bin`) plus optional `.png` preview.
+  - `export/session_name/manifest.json` with metadata (source FPS, target FPS, frame count, depth model, timestamps, source capture info).
+- Warn when the output target is FAT32 or low on space (field tests showed corruption beyond ~4GB on FAT32; prefer NTFS/exFAT).
+
+## Threading and performance
+- Use worker threads/process pool for decoding vs. disk writes to keep UI responsive.
+- Avoid unbounded queues; apply backpressure to prevent memory blow-ups on long clips.
+- Provide cancellation hooks in UI to abort extraction.
+
+## Error handling
+- Validate input (file exists, readable; target FPS > 0; target FPS <= source FPS).
+- Gracefully handle missing depth models or SDK errors with clear UI messages.
+- Treat per-frame decode errors as recoverable where possible (log and continue), mirroring field tolerance for `CORRUPTED_FRAME`.
+- Record recoverable errors in logs; halt on unrecoverable ingest failures.
+
+## Next steps for implementation
+- Define dependency set (`requirements.txt`) and bootstrap PySide6 + ZED SDK bindings.
+- Implement ingestion metadata reader and stub extraction pipeline interfaces.
+- Wire basic GUI skeleton with mocked data for FPS slider and stream selection.
+- Add test harness for option validation and FPS downsampling calculation (e.g., mapping source 60 FPS → target 10 FPS as `keep_every=6`).
+- Specify depth export format (float32 + header or .npy) and include model provenance in manifests.

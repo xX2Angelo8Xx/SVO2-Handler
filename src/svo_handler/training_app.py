@@ -380,17 +380,8 @@ class TrainingApp(QtWidgets.QMainWindow):
     
     def _on_image_size_changed(self, text: str) -> None:
         """Handle image size dropdown change."""
-        # Sync checkbox when "Source" is selected
-        if text == "Source":
-            if not self.use_source_resolution_check.isChecked():
-                self.use_source_resolution_check.blockSignals(True)
-                self.use_source_resolution_check.setChecked(True)
-                self.use_source_resolution_check.blockSignals(False)
-        else:
-            if self.use_source_resolution_check.isChecked():
-                self.use_source_resolution_check.blockSignals(True)
-                self.use_source_resolution_check.setChecked(False)
-                self.use_source_resolution_check.blockSignals(False)
+        # No additional action needed - just update the selection
+        pass
     
     def _browse_source_folder(self) -> None:
         """Browse for source training folder."""

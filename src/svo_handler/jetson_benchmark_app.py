@@ -26,7 +26,8 @@ from typing import List, Optional, Tuple
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QFileDialog, QTextEdit,
-    QGroupBox, QMessageBox, QProgressDialog, QScrollArea, QSpinBox, QCheckBox
+    QGroupBox, QMessageBox, QProgressDialog, QScrollArea, QSpinBox, QCheckBox,
+    QStackedWidget
 )
 from PySide6.QtCore import Qt, QThread, Signal, QSize
 from PySide6.QtGui import QFont, QPixmap, QImage, QPainter, QPen, QColor, QBrush
@@ -585,13 +586,20 @@ class JetsonBenchmarkApp(QMainWindow):
         self.worker = None
         self.validation_viewer = None
         
+        # Use stacked widget to switch between views
+        self.stacked_widget = QStackedWidget()
+        self.setCentralWidget(self.stacked_widget)
+        
         self._build_ui()
     
     def _build_ui(self):
         """Build the main UI."""
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
+        # Create main widget
+        self.main_widget = QWidget()
+        main_layout = QVBoxLayout(self.main_widget)
+        
+        # Add to stacked widget
+        self.stacked_widget.addWidget(self.main_widget)
         
         # Title
         title = QLabel("Jetson YOLO Benchmark & Validation Tool")
@@ -844,21 +852,18 @@ class JetsonBenchmarkApp(QMainWindow):
     def _start_validation(self, run_folder: Path):
         """Start validation viewer."""
         try:
-            # Hide setup widget
-            self.setup_widget.setVisible(False)
-            
             # Create validation viewer
             self.validation_viewer = ValidationViewer(run_folder)
             self.validation_viewer.validation_complete.connect(self._on_validation_complete)
             
-            # Replace central widget
-            self.setCentralWidget(self.validation_viewer)
+            # Add to stacked widget and switch to it
+            self.stacked_widget.addWidget(self.validation_viewer)
+            self.stacked_widget.setCurrentWidget(self.validation_viewer)
             
             self.output_text.append(f"\n🔍 Starting validation for {len(self.validation_viewer.image_files)} images")
             self.statusBar().showMessage("Validation mode - Review each image")
         except ValueError as e:
             # Validation viewer initialization failed (no images)
-            self.setup_widget.setVisible(True)
             self.output_text.append(f"\n❌ Cannot start validation: {str(e)}")
             QMessageBox.critical(
                 self,
@@ -872,24 +877,12 @@ class JetsonBenchmarkApp(QMainWindow):
         self.output_text.append("\n✅ Validation complete! Report generated.")
         self.statusBar().showMessage("Validation complete - Ready for next benchmark")
         
-        # Create a fresh central widget with setup_widget and output
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
+        # Switch back to main widget
+        self.stacked_widget.setCurrentWidget(self.main_widget)
         
-        # Re-add setup widget
-        main_layout.addWidget(self.setup_widget)
-        self.setup_widget.setVisible(True)
-        
-        # Re-add output area (find it from setup_widget's parent layout)
-        output_group = QGroupBox("Output")
-        output_layout = QVBoxLayout()
-        output_layout.addWidget(self.output_text)
-        output_group.setLayout(output_layout)
-        main_layout.addWidget(output_group)
-        
-        # Cleanup validation viewer
+        # Remove and cleanup validation viewer
         if self.validation_viewer:
+            self.stacked_widget.removeWidget(self.validation_viewer)
             self.validation_viewer.deleteLater()
             self.validation_viewer = None
 

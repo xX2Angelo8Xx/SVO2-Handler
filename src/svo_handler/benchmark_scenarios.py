@@ -265,6 +265,7 @@ class SVOPipelineScenario(BenchmarkScenario):
                 - model_path: Path to YOLO .engine model
                 - conf_threshold: Detection confidence threshold
                 - save_images: Whether to save annotated frames
+                - save_annotations_only: Save only YOLO .txt files (fast)
                 - output_dir: Directory for saved images (if save_images=True)
                 - loading_progress_callback: Function to call with loading progress
                 - preview_callback: Function to call with preview image
@@ -281,6 +282,7 @@ class SVOPipelineScenario(BenchmarkScenario):
             model_path = config.get('model_path')
             self.conf_threshold = config.get('conf_threshold', 0.25)
             self.save_images = config.get('save_images', False)
+            self.save_annotations_only = config.get('save_annotations_only', False)
             self.output_dir = config.get('output_dir')
             self.preview_callback = config.get('preview_callback')
             self.loading_progress_callback = config.get('loading_progress_callback')
@@ -448,7 +450,7 @@ class SVOPipelineScenario(BenchmarkScenario):
         
         timings['depth'] = (time.time() - depth_start) * 1000
         
-        # 4. Save images if requested
+        # 4. Save images or annotations
         if self.save_images and self.output_dir:
             save_start = time.time()
             
@@ -488,6 +490,42 @@ class SVOPipelineScenario(BenchmarkScenario):
                 # Convert to RGB for Qt display
                 preview_rgb = cv2.cvtColor(annotated_img, cv2.COLOR_BGR2RGB)
                 self.preview_callback(preview_rgb)
+        
+        elif self.save_annotations_only and self.output_dir:
+            # Fast mode: Save only YOLO .txt annotations
+            save_start = time.time()
+            
+            # Get image dimensions for YOLO normalization
+            img_height, img_width = img_bgr.shape[:2]
+            
+            # Create YOLO format annotations
+            annotation_lines = []
+            for det in detections:
+                x1, y1, x2, y2 = det['bbox']
+                class_id = det['class']
+                
+                # Convert to YOLO format (normalized center x, center y, width, height)
+                center_x = ((x1 + x2) / 2) / img_width
+                center_y = ((y1 + y2) / 2) / img_height
+                width = (x2 - x1) / img_width
+                height = (y2 - y1) / img_height
+                
+                # YOLO format: class_id center_x center_y width height
+                annotation_lines.append(f"{class_id} {center_x:.6f} {center_y:.6f} {width:.6f} {height:.6f}")
+            
+            # Save annotation file
+            annotation_filename = f"frame_{self.frame_index:06d}.txt"
+            annotation_path = Path(self.output_dir) / annotation_filename
+            
+            if annotation_lines:  # Only save if there are detections
+                with open(annotation_path, 'w') as f:
+                    f.write('\n'.join(annotation_lines))
+            else:
+                # Create empty file to maintain frame index consistency
+                annotation_path.touch()
+            
+            timings['save'] = (time.time() - save_start) * 1000
+
         
         self.frame_index += 1
         

@@ -286,13 +286,15 @@ class SVOScenarioWorker(QThread):
     start_processing = Signal()  # Internal signal to start processing phase
     
     def __init__(self, engine_path: Path, svo_path: Path, output_folder: Path,
-                 conf_threshold: float = 0.25, save_images: bool = False):
+                 conf_threshold: float = 0.25, save_images: bool = False,
+                 save_annotations_only: bool = False):
         super().__init__()
         self.engine_path = engine_path
         self.svo_path = svo_path
         self.output_folder = output_folder
         self.conf_threshold = conf_threshold
         self.save_images = save_images
+        self.save_annotations_only = save_annotations_only
         self._cancelled = False
         self._start_benchmark = False  # Flag to start benchmark phase
         self.scenario = None
@@ -328,12 +330,17 @@ class SVOScenarioWorker(QThread):
             # Create and setup scenario
             self.scenario = SVOPipelineScenario()
             
+            output_dir = None
+            if self.save_images or self.save_annotations_only:
+                output_dir = str(self.output_folder / "frames")
+            
             config = {
                 'svo_path': str(self.svo_path),
                 'model_path': str(self.engine_path),
                 'conf_threshold': self.conf_threshold,
                 'save_images': self.save_images,
-                'output_dir': str(self.output_folder / "frames") if self.save_images else None,
+                'save_annotations_only': self.save_annotations_only,
+                'output_dir': output_dir,
                 'loading_progress_callback': loading_callback,
                 'preview_callback': preview_callback if self.save_images else None
             }
@@ -382,6 +389,14 @@ class SVOScenarioWorker(QThread):
             if self.save_images:
                 all_timings['save'] = []
             
+            # Frame-to-frame timing
+            frame_intervals = []
+            last_frame_time = None
+            
+            # Detection vs no-detection timing
+            frames_with_detections_times = []
+            frames_empty_times = []
+            
             # Process entire SVO file
             while not self._cancelled:
                 frame_start = time.time()
@@ -410,9 +425,21 @@ class SVOScenarioWorker(QThread):
                     if key in all_timings:
                         all_timings[key].append(value)
                 
-                # Calculate FPS
+                # Calculate FPS and frame timing
                 frame_time = time.time() - frame_start
                 fps = 1.0 / frame_time if frame_time > 0 else 0
+                
+                # Track frame-to-frame intervals
+                if last_frame_time is not None:
+                    interval = frame_time
+                    frame_intervals.append(interval * 1000)  # Convert to ms
+                last_frame_time = frame_time
+                
+                # Track timing by detection status
+                if len(detections) > 0:
+                    frames_with_detections_times.append(frame_time * 1000)
+                else:
+                    frames_empty_times.append(frame_time * 1000)
                 
                 # Update progress with detection info
                 status = f"Frame {frames_processed}/{total_frames}"
@@ -435,6 +462,34 @@ class SVOScenarioWorker(QThread):
                 for key, times in all_timings.items()
             }
             
+            # Frame-to-frame interval statistics
+            import statistics
+            frame_interval_stats = {}
+            if frame_intervals:
+                frame_interval_stats = {
+                    'mean': statistics.mean(frame_intervals),
+                    'median': statistics.median(frame_intervals),
+                    'stdev': statistics.stdev(frame_intervals) if len(frame_intervals) > 1 else 0.0,
+                    'min': min(frame_intervals),
+                    'max': max(frame_intervals)
+                }
+            
+            # Detection vs no-detection timing comparison
+            detection_timing_comparison = {
+                'frames_with_detections': {
+                    'count': len(frames_with_detections_times),
+                    'mean_ms': statistics.mean(frames_with_detections_times) if frames_with_detections_times else 0.0,
+                    'median_ms': statistics.median(frames_with_detections_times) if frames_with_detections_times else 0.0,
+                    'stdev_ms': statistics.stdev(frames_with_detections_times) if len(frames_with_detections_times) > 1 else 0.0
+                },
+                'frames_empty': {
+                    'count': len(frames_empty_times),
+                    'mean_ms': statistics.mean(frames_empty_times) if frames_empty_times else 0.0,
+                    'median_ms': statistics.median(frames_empty_times) if frames_empty_times else 0.0,
+                    'stdev_ms': statistics.stdev(frames_empty_times) if len(frames_empty_times) > 1 else 0.0
+                }
+            }
+            
             stats = {
                 'scenario': 'SVO2 Pipeline',
                 'total_frames': frames_processed,
@@ -442,6 +497,8 @@ class SVOScenarioWorker(QThread):
                 'mean_fps': frames_processed / total_time if total_time > 0 else 0,
                 'mean_latency_ms': (total_time / frames_processed) * 1000 if frames_processed > 0 else 0,
                 'component_times_ms': component_times,
+                'frame_interval_stats_ms': frame_interval_stats,
+                'detection_timing_comparison': detection_timing_comparison,
                 'total_detections': total_detections,
                 'frames_with_detections': frames_with_detections,
                 'frames_empty': frames_empty,
@@ -975,6 +1032,12 @@ class JetsonBenchmarkApp(QMainWindow):
         self.save_images_check.toggled.connect(self._on_save_images_toggled)
         svo_options_layout.addWidget(self.save_images_check)
         
+        self.save_annotations_only_check = QCheckBox("Save annotations only (.txt)")
+        self.save_annotations_only_check.setChecked(False)
+        self.save_annotations_only_check.setToolTip("Fast mode: Save YOLO .txt files only, overlay later")
+        self.save_annotations_only_check.toggled.connect(self._on_save_annotations_only_toggled)
+        svo_options_layout.addWidget(self.save_annotations_only_check)
+        
         self.show_preview_check = QCheckBox("Show live preview")
         self.show_preview_check.setChecked(True)
         self.show_preview_check.setEnabled(False)
@@ -1179,6 +1242,18 @@ class JetsonBenchmarkApp(QMainWindow):
         self.show_preview_check.setEnabled(checked)
         if checked:
             self.show_preview_check.setChecked(True)
+            # Disable annotations-only when saving images
+            if self.save_annotations_only_check.isChecked():
+                self.save_annotations_only_check.setChecked(False)
+    
+    def _on_save_annotations_only_toggled(self, checked: bool):
+        """Handle annotation-only mode toggle."""
+        if checked:
+            # Disable save images when annotations-only is enabled
+            if self.save_images_check.isChecked():
+                self.save_images_check.setChecked(False)
+            self.show_preview_check.setEnabled(False)
+            self.show_preview_check.setChecked(False)
     
     def _load_svo(self):
         """Initialize SVO2 file (loading phase)."""
@@ -1222,8 +1297,10 @@ class JetsonBenchmarkApp(QMainWindow):
         
         # Create worker
         save_images = self.save_images_check.isChecked()
+        save_annotations_only = self.save_annotations_only_check.isChecked()
         self.svo_worker = SVOScenarioWorker(engine_path, svo_path, run_folder, 
-                                            conf_threshold=0.25, save_images=save_images)
+                                            conf_threshold=0.25, save_images=save_images,
+                                            save_annotations_only=save_annotations_only)
         self.svo_worker.loading_progress.connect(self._on_svo_loading_progress)
         self.svo_worker.loading_complete.connect(self._on_svo_loading_complete)
         self.svo_worker.loading_failed.connect(self._on_svo_loading_failed)
@@ -1349,9 +1426,45 @@ class JetsonBenchmarkApp(QMainWindow):
         self.output_text.append(f"  Avg Detections per Frame: {stats['avg_detections_per_frame']:.2f}")
         self.output_text.append(f"  Mean FPS: {stats['mean_fps']:.2f}")
         self.output_text.append(f"  Mean Latency: {stats['mean_latency_ms']:.2f} ms")
+        
         self.output_text.append("\nCOMPONENT TIMING BREAKDOWN:")
         for component, time_ms in stats['component_times_ms'].items():
             self.output_text.append(f"  {component.capitalize()}: {time_ms:.2f} ms")
+        
+        # Frame-to-frame interval statistics
+        if 'frame_interval_stats_ms' in stats and stats['frame_interval_stats_ms']:
+            interval_stats = stats['frame_interval_stats_ms']
+            self.output_text.append("\nFRAME-TO-FRAME TIMING:")
+            self.output_text.append(f"  Mean: {interval_stats.get('mean', 0):.2f} ms")
+            self.output_text.append(f"  Median: {interval_stats.get('median', 0):.2f} ms")
+            self.output_text.append(f"  Std Dev: {interval_stats.get('stdev', 0):.2f} ms")
+            self.output_text.append(f"  Min: {interval_stats.get('min', 0):.2f} ms")
+            self.output_text.append(f"  Max: {interval_stats.get('max', 0):.2f} ms")
+        
+        # Detection vs no-detection comparison
+        if 'detection_timing_comparison' in stats:
+            comparison = stats['detection_timing_comparison']
+            self.output_text.append("\nDETECTION vs EMPTY FRAME TIMING:")
+            
+            with_det = comparison.get('frames_with_detections', {})
+            empty = comparison.get('frames_empty', {})
+            
+            self.output_text.append(f"  Frames WITH detections ({with_det.get('count', 0)} frames):")
+            self.output_text.append(f"    Mean: {with_det.get('mean_ms', 0):.2f} ms")
+            self.output_text.append(f"    Median: {with_det.get('median_ms', 0):.2f} ms")
+            self.output_text.append(f"    Std Dev: {with_det.get('stdev_ms', 0):.2f} ms")
+            
+            self.output_text.append(f"  Frames EMPTY ({empty.get('count', 0)} frames):")
+            self.output_text.append(f"    Mean: {empty.get('mean_ms', 0):.2f} ms")
+            self.output_text.append(f"    Median: {empty.get('median_ms', 0):.2f} ms")
+            self.output_text.append(f"    Std Dev: {empty.get('stdev_ms', 0):.2f} ms")
+            
+            # Calculate time difference
+            if with_det.get('mean_ms', 0) > 0 and empty.get('mean_ms', 0) > 0:
+                diff = with_det['mean_ms'] - empty['mean_ms']
+                diff_pct = (diff / empty['mean_ms']) * 100
+                self.output_text.append(f"\n  ➜ Frames with detections are {diff:.2f} ms ({diff_pct:+.1f}%) {'slower' if diff > 0 else 'faster'}")
+        
         self.output_text.append("-" * 70)
         
         if stats.get('images_saved'):
@@ -1359,8 +1472,26 @@ class JetsonBenchmarkApp(QMainWindow):
         
         self.statusBar().showMessage(f"Benchmark complete - {stats['mean_fps']:.2f} FPS")
         
-        # Show summary
+        # Show enhanced summary
         component_summary = "\n".join([f"  {k}: {v:.2f} ms" for k, v in stats['component_times_ms'].items()])
+        
+        # Add detection comparison to dialog
+        detection_info = ""
+        if 'detection_timing_comparison' in stats:
+            comparison = stats['detection_timing_comparison']
+            with_det = comparison.get('frames_with_detections', {})
+            empty = comparison.get('frames_empty', {})
+            
+            if with_det.get('mean_ms', 0) > 0 and empty.get('mean_ms', 0) > 0:
+                diff = with_det['mean_ms'] - empty['mean_ms']
+                diff_pct = (diff / empty['mean_ms']) * 100
+                detection_info = (
+                    f"\n\nTiming Comparison:\n"
+                    f"  With detections: {with_det['mean_ms']:.2f} ms ({with_det['count']} frames)\n"
+                    f"  Empty frames: {empty['mean_ms']:.2f} ms ({empty['count']} frames)\n"
+                    f"  Difference: {diff:+.2f} ms ({diff_pct:+.1f}%)"
+                )
+        
         QMessageBox.information(
             self,
             "Benchmark Complete",
@@ -1369,6 +1500,7 @@ class JetsonBenchmarkApp(QMainWindow):
             f"Mean FPS: {stats['mean_fps']:.2f}\n"
             f"Mean Latency: {stats['mean_latency_ms']:.2f} ms\n\n"
             f"Component Breakdown:\n{component_summary}"
+            f"{detection_info}"
         )
     
     def _on_svo_benchmark_failed(self, error_msg: str):

@@ -34,16 +34,22 @@ from PySide6.QtCore import Qt, QThread, Signal, QSize
 from PySide6.QtGui import QFont, QPixmap, QImage, QPainter, QPen, QColor, QBrush
 
 # Matplotlib for depth plot
+MATPLOTLIB_AVAILABLE = False
+FigureCanvasQTAgg = None
+
 try:
     import matplotlib
-    matplotlib.use('Qt5Agg')
-    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+    # Try QtAgg backend (works with PySide6/PyQt6)
+    matplotlib.use('QtAgg')
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
     from matplotlib.figure import Figure
-    import matplotlib.pyplot as plt
     MATPLOTLIB_AVAILABLE = True
-except ImportError:
-    MATPLOTLIB_AVAILABLE = False
-    print("Warning: matplotlib not available, depth plot disabled")
+except Exception as e:
+    # If QtAgg fails, matplotlib is not usable with current Qt version
+    print(f"Warning: matplotlib not available ({type(e).__name__}: {e})")
+    print("Depth plot will be disabled. This is non-critical.")
+    # Create dummy base class
+    FigureCanvasQTAgg = QWidget
 
 
 class DepthPlotCanvas(FigureCanvasQTAgg if MATPLOTLIB_AVAILABLE else QWidget):
@@ -1161,17 +1167,6 @@ class JetsonBenchmarkApp(QMainWindow):
         main_layout.addWidget(output_group)
         
         self.output_text.append("Ready. Select scenario and configure settings.")
-        main_layout.addWidget(self.preview_group)
-        
-        # Output area
-        output_group = QGroupBox("Output")
-        output_layout = QVBoxLayout()
-        self.output_text = QTextEdit()
-        self.output_text.setReadOnly(True)
-        self.output_text.setMaximumHeight(200)
-        output_layout.addWidget(self.output_text)
-        output_group.setLayout(output_layout)
-        main_layout.addWidget(output_group)
         
         self.output_text.append("Ready. Select scenario, engine, and input to begin.")
         

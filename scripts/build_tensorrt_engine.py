@@ -3,9 +3,21 @@
 Build TensorRT engine from YOLO model for Jetson deployment.
 
 This script converts ONNX models to optimized TensorRT engines for the Jetson.
-Must be run ON THE JETSON to optimize for that specific hardware.
-
-Usage:
+Must be run ON THE JETSON to optimize for that specifi    # Get PyTorch model path
+    if args.onnx_path:
+        pt_path = args.onnx_path
+        if not pt_path.exists():
+            print(f"❌ PyTorch model file not found: {pt_path}")
+            return 1
+    elif args.export_folder:
+        try:
+            pt_path = find_pytorch_model(args.export_folder)
+        except FileNotFoundError as e:
+            print(f"❌ {e}")
+            return 1
+    else:
+        parser.print_help()
+        return 1age:
     python build_tensorrt_engine.py <model_export_folder>
     
 Example:
@@ -18,34 +30,34 @@ import time
 from pathlib import Path
 
 
-def find_onnx_model(export_folder: Path) -> Path:
-    """Find ONNX model in export folder."""
+def find_pytorch_model(export_folder: Path) -> Path:
+    """Find PyTorch model in export folder."""
     models_dir = export_folder / "models"
     if not models_dir.exists():
         raise FileNotFoundError(f"Models directory not found: {models_dir}")
     
-    onnx_files = list(models_dir.glob("*.onnx"))
-    if not onnx_files:
-        raise FileNotFoundError(f"No ONNX model found in {models_dir}")
+    pt_files = list(models_dir.glob("*.pt"))
+    if not pt_files:
+        raise FileNotFoundError(f"No PyTorch (.pt) model found in {models_dir}")
     
-    if len(onnx_files) > 1:
-        print(f"⚠️  Multiple ONNX files found, using: {onnx_files[0].name}")
+    if len(pt_files) > 1:
+        print(f"⚠️  Multiple .pt files found, using: {pt_files[0].name}")
     
-    return onnx_files[0]
+    return pt_files[0]
 
 
 def build_tensorrt_engine(
-    onnx_path: Path,
+    pt_path: Path,
     output_path: Path,
     fp16: bool = True,
     workspace: int = 4,
     verbose: bool = True
 ) -> bool:
     """
-    Build TensorRT engine from ONNX model.
+    Build TensorRT engine from PyTorch model.
     
     Args:
-        onnx_path: Path to ONNX model file
+        pt_path: Path to PyTorch .pt model file
         output_path: Path for output .engine file
         fp16: Enable FP16 precision (faster, slightly less accurate)
         workspace: Max workspace size in GB
@@ -64,7 +76,7 @@ def build_tensorrt_engine(
     print("=" * 70)
     print("TensorRT Engine Builder")
     print("=" * 70)
-    print(f"ONNX Model: {onnx_path}")
+    print(f"PyTorch Model: {pt_path}")
     print(f"Output: {output_path}")
     print(f"FP16: {fp16}")
     print(f"Workspace: {workspace}GB")
@@ -101,8 +113,8 @@ def build_tensorrt_engine(
     start_time = time.time()
     
     try:
-        # Load model
-        model = YOLO(str(onnx_path))
+        # Load PyTorch model
+        model = YOLO(str(pt_path))
         
         # Export to TensorRT
         # Ultralytics will automatically build the engine
@@ -121,7 +133,7 @@ def build_tensorrt_engine(
         print(f"✓ TensorRT engine built successfully in {elapsed:.1f}s")
         
         # Find generated engine file
-        engine_path = onnx_path.with_suffix('.engine')
+        engine_path = pt_path.with_suffix('.engine')
         if engine_path.exists():
             size_mb = engine_path.stat().st_size / 1024 / 1024
             print(f"✓ Engine file: {engine_path}")
@@ -220,15 +232,15 @@ Examples:
     
     args = parser.parse_args()
     
-    # Determine ONNX path
+    # Determine PyTorch model path
     if args.onnx_path:
-        onnx_path = args.onnx_path
-        if not onnx_path.exists():
-            print(f"❌ ONNX file not found: {onnx_path}")
+        pt_path = args.onnx_path
+        if not pt_path.exists():
+            print(f"❌ PyTorch model file not found: {pt_path}")
             return 1
     elif args.export_folder:
         try:
-            onnx_path = find_onnx_model(args.export_folder)
+            pt_path = find_pytorch_model(args.export_folder)
         except FileNotFoundError as e:
             print(f"❌ {e}")
             return 1
@@ -240,11 +252,11 @@ Examples:
     if args.output:
         output_path = args.output
     else:
-        output_path = onnx_path.with_suffix('.engine')
+        output_path = pt_path.with_suffix('.engine')
     
     # Build engine
     success = build_tensorrt_engine(
-        onnx_path=onnx_path,
+        pt_path=pt_path,
         output_path=output_path,
         fp16=not args.no_fp16,
         workspace=args.workspace,

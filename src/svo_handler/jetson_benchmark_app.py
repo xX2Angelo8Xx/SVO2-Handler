@@ -4,13 +4,14 @@ Jetson Benchmark Application for YOLO model validation.
 
 Workflow:
 1. Select TensorRT engine file
-2. Select test image folder  
-3. Run inference on all images (saves results to benchmark run folder)
+2. Choose scenario: Pure Inference OR SVO2 Pipeline
+3. Run benchmark on images/SVO2 file
 4. Manual validation: review detections, mark correct/missed/false
 5. Generate statistics report
 
-The app copies test images to a timestamped benchmark folder and runs
-inference, saving detection coordinates as .txt files alongside images.
+Supports multiple benchmark scenarios:
+- Pure Inference: TensorRT on pre-loaded images (baseline)
+- SVO2 Pipeline: Full pipeline with depth extraction (NEURAL_PLUS)
 """
 
 import sys
@@ -27,7 +28,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QFileDialog, QTextEdit,
     QGroupBox, QMessageBox, QProgressDialog, QScrollArea, QSpinBox, QCheckBox,
-    QStackedWidget
+    QStackedWidget, QComboBox
 )
 from PySide6.QtCore import Qt, QThread, Signal, QSize
 from PySide6.QtGui import QFont, QPixmap, QImage, QPainter, QPen, QColor, QBrush
@@ -188,6 +189,198 @@ class InferenceWorker(QThread):
             
         except Exception as e:
             self.inference_failed.emit(f"Error during inference: {str(e)}")
+
+
+class SVOScenarioWorker(QThread):
+    """Background worker for SVO2 pipeline benchmark."""
+    
+    loading_progress = Signal(int, str)  # progress %, message
+    loading_complete = Signal()  # SVO loaded and ready
+    loading_failed = Signal(str)  # error message
+    
+    progress_updated = Signal(int, int, str, float)  # current, total, status, fps
+    frame_processed = Signal(object)  # preview image (numpy RGB array)
+    benchmark_complete = Signal(str, float, dict)  # run_folder, total_time, stats
+    benchmark_failed = Signal(str)  # error message
+    
+    start_processing = Signal()  # Internal signal to start processing phase
+    
+    def __init__(self, engine_path: Path, svo_path: Path, output_folder: Path,
+                 conf_threshold: float = 0.25, save_images: bool = False):
+        super().__init__()
+        self.engine_path = engine_path
+        self.svo_path = svo_path
+        self.output_folder = output_folder
+        self.conf_threshold = conf_threshold
+        self.save_images = save_images
+        self._cancelled = False
+        self._start_benchmark = False  # Flag to start benchmark phase
+        self.scenario = None
+        
+        # Connect internal signal
+        self.start_processing.connect(self._set_start_flag)
+    
+    def cancel(self):
+        """Request cancellation of the worker."""
+        self._cancelled = True
+    
+    def _set_start_flag(self):
+        """Set flag to start benchmark processing."""
+        self._start_benchmark = True
+    
+    def run(self):
+        """Run SVO2 pipeline benchmark."""
+        try:
+            from svo_handler.benchmark_scenarios import SVOPipelineScenario
+            import numpy as np
+            
+            # Phase 1: Loading (this is what takes 30-60s)
+            def loading_callback(progress: int, message: str):
+                if self._cancelled:
+                    return
+                self.loading_progress.emit(progress, message)
+            
+            def preview_callback(img_rgb: np.ndarray):
+                if self._cancelled:
+                    return
+                self.frame_processed.emit(img_rgb)
+            
+            # Create and setup scenario
+            self.scenario = SVOPipelineScenario()
+            
+            config = {
+                'svo_path': str(self.svo_path),
+                'model_path': str(self.engine_path),
+                'conf_threshold': self.conf_threshold,
+                'save_images': self.save_images,
+                'output_dir': str(self.output_folder / "frames") if self.save_images else None,
+                'loading_progress_callback': loading_callback,
+                'preview_callback': preview_callback if self.save_images else None
+            }
+            
+            if not self.scenario.setup(config):
+                self.loading_failed.emit("Failed to initialize SVO2 pipeline")
+                return
+            
+            if self._cancelled:
+                self.scenario.cleanup()
+                return
+            
+            # Loading complete!
+            self.loading_complete.emit()
+            
+            # Phase 2: Wait for start signal
+            while not self._start_benchmark and not self._cancelled:
+                self.msleep(100)  # Wait 100ms
+            
+            if self._cancelled:
+                self.scenario.cleanup()
+                return
+            
+            # Phase 3: Run benchmark
+            self._run_benchmark_internal()
+            
+        except Exception as e:
+            import traceback
+            error_msg = f"Error during SVO benchmark: {str(e)}\n{traceback.format_exc()}"
+            self.benchmark_failed.emit(error_msg)
+            if self.scenario:
+                self.scenario.cleanup()
+    
+    def _run_benchmark_internal(self):
+        """Run the actual benchmark (internal, runs in worker thread)."""
+        try:
+            if not self.scenario:
+                self.benchmark_failed.emit("Scenario not ready")
+                return
+            
+            start_time = time.time()
+            total_frames = self.scenario.total_frames
+            frames_processed = 0
+            detection_counts = []
+            all_timings = {'grab': [], 'inference': [], 'depth': []}
+            if self.save_images:
+                all_timings['save'] = []
+            
+            # Process entire SVO file
+            while not self._cancelled:
+                frame_start = time.time()
+                
+                # Run frame processing
+                result = self.scenario.run_frame(None)
+                
+                # Check for completion
+                if result is None:
+                    break  # End of SVO
+                
+                # Skip corrupted frames
+                if result.get('skipped'):
+                    continue
+                
+                frames_processed += 1
+                detection_counts.append(len(result.get('detections', [])))
+                
+                # Accumulate timings
+                for key, value in result.get('timings', {}).items():
+                    if key in all_timings:
+                        all_timings[key].append(value)
+                
+                # Calculate FPS
+                frame_time = time.time() - frame_start
+                fps = 1.0 / frame_time if frame_time > 0 else 0
+                
+                # Update progress
+                status = f"Frame {frames_processed}/{total_frames}"
+                self.progress_updated.emit(frames_processed, total_frames, status, fps)
+            
+            if self._cancelled:
+                self.scenario.cleanup()
+                return
+            
+            total_time = time.time() - start_time
+            
+            # Calculate statistics
+            total_detections = sum(detection_counts)
+            frames_with_detections = sum(1 for count in detection_counts if count > 0)
+            frames_empty = len(detection_counts) - frames_with_detections
+            
+            # Component timing averages
+            component_times = {
+                key: sum(times) / len(times) if times else 0.0
+                for key, times in all_timings.items()
+            }
+            
+            stats = {
+                'scenario': 'SVO2 Pipeline',
+                'total_frames': frames_processed,
+                'total_time_seconds': total_time,
+                'mean_fps': frames_processed / total_time if total_time > 0 else 0,
+                'mean_latency_ms': (total_time / frames_processed) * 1000 if frames_processed > 0 else 0,
+                'component_times_ms': component_times,
+                'total_detections': total_detections,
+                'frames_with_detections': frames_with_detections,
+                'frames_empty': frames_empty,
+                'avg_detections_per_frame': total_detections / frames_processed if frames_processed > 0 else 0,
+                'conf_threshold': self.conf_threshold,
+                'engine_path': str(self.engine_path),
+                'svo_path': str(self.svo_path),
+                'images_saved': self.save_images
+            }
+            
+            # Save statistics
+            stats_file = self.output_folder / "benchmark_stats.json"
+            with open(stats_file, 'w') as f:
+                json.dump(stats, f, indent=2)
+            
+            self.scenario.cleanup()
+            self.benchmark_complete.emit(str(self.output_folder), total_time, stats)
+            
+        except Exception as e:
+            import traceback
+            error_msg = f"Error during benchmark: {str(e)}\n{traceback.format_exc()}"
+            self.benchmark_failed.emit(error_msg)
+            if self.scenario:
+                self.scenario.cleanup()
 
 
 class ValidationViewer(QWidget):
@@ -611,8 +804,26 @@ class JetsonBenchmarkApp(QMainWindow):
         self.setup_widget = QWidget()
         setup_layout = QVBoxLayout(self.setup_widget)
         
+        # Scenario selection
+        scenario_group = QGroupBox("1. Select Benchmark Scenario")
+        scenario_layout = QVBoxLayout()
+        self.scenario_combo = QComboBox()
+        self.scenario_combo.addItems([
+            "Pure Inference (Images)",
+            "SVO2 Pipeline (with Depth)"
+        ])
+        self.scenario_combo.currentIndexChanged.connect(self._on_scenario_changed)
+        scenario_layout.addWidget(self.scenario_combo)
+        
+        scenario_desc = QLabel("Pure Inference: Baseline TensorRT on images\n"
+                              "SVO2 Pipeline: Full pipeline with depth extraction (NEURAL_PLUS)")
+        scenario_desc.setStyleSheet("color: #666; font-size: 10px; font-style: italic;")
+        scenario_layout.addWidget(scenario_desc)
+        scenario_group.setLayout(scenario_layout)
+        setup_layout.addWidget(scenario_group)
+        
         # Engine file selection
-        engine_group = QGroupBox("1. Select TensorRT Engine")
+        engine_group = QGroupBox("2. Select TensorRT Engine")
         engine_layout = QHBoxLayout()
         self.engine_edit = QLineEdit()
         self.engine_edit.setPlaceholderText("Path to .engine file...")
@@ -623,29 +834,34 @@ class JetsonBenchmarkApp(QMainWindow):
         engine_group.setLayout(engine_layout)
         setup_layout.addWidget(engine_group)
         
-        # Test folder selection
-        test_group = QGroupBox("2. Select Test Images Folder")
-        test_layout = QVBoxLayout()
+        # Test folder/SVO file selection (dynamic based on scenario)
+        self.test_group = QGroupBox("3. Select Input")
+        self.test_layout = QVBoxLayout()
         folder_layout = QHBoxLayout()
         self.test_folder_edit = QLineEdit()
-        self.test_folder_edit.setPlaceholderText("Path to test images folder...")
         self.test_folder_edit.textChanged.connect(self._on_folder_changed)
-        test_browse_btn = QPushButton("Browse")
-        test_browse_btn.clicked.connect(self._browse_test_folder)
+        self.test_browse_btn = QPushButton("Browse")
+        self.test_browse_btn.clicked.connect(self._browse_input)
         folder_layout.addWidget(self.test_folder_edit)
-        folder_layout.addWidget(test_browse_btn)
-        test_layout.addLayout(folder_layout)
+        folder_layout.addWidget(self.test_browse_btn)
+        self.test_layout.addLayout(folder_layout)
         
-        # Image count label
+        # Image count label (for Pure Inference only)
         self.image_count_label = QLabel("")
         self.image_count_label.setStyleSheet("color: #2196F3; font-size: 11px;")
-        test_layout.addWidget(self.image_count_label)
+        self.test_layout.addWidget(self.image_count_label)
         
-        test_group.setLayout(test_layout)
-        setup_layout.addWidget(test_group)
+        # SVO info label (for SVO2 Pipeline only)
+        self.svo_info_label = QLabel("")
+        self.svo_info_label.setStyleSheet("color: #2196F3; font-size: 11px;")
+        self.svo_info_label.setVisible(False)
+        self.test_layout.addWidget(self.svo_info_label)
         
-        # Max images selection
-        images_group = QGroupBox("3. Number of Images to Test")
+        self.test_group.setLayout(self.test_layout)
+        setup_layout.addWidget(self.test_group)
+        
+        # Max images selection (for Pure Inference only)
+        self.images_group = QGroupBox("4. Number of Images to Test")
         images_layout = QVBoxLayout()
         
         images_control_layout = QHBoxLayout()
@@ -667,14 +883,52 @@ class JetsonBenchmarkApp(QMainWindow):
         note_label.setStyleSheet("color: #666; font-size: 10px; font-style: italic;")
         images_layout.addWidget(note_label)
         
-        images_group.setLayout(images_layout)
-        setup_layout.addWidget(images_group)
+        self.images_group.setLayout(images_layout)
+        setup_layout.addWidget(self.images_group)
         
-        # Run button
-        self.run_btn = QPushButton("▶ Run Inference")
+        # Save images option (for SVO2 Pipeline only)
+        self.svo_options_group = QGroupBox("4. SVO2 Processing Options")
+        svo_options_layout = QVBoxLayout()
+        
+        self.save_images_check = QCheckBox("Save processed frames (raw + annotated)")
+        self.save_images_check.setChecked(False)
+        self.save_images_check.toggled.connect(self._on_save_images_toggled)
+        svo_options_layout.addWidget(self.save_images_check)
+        
+        save_warning = QLabel("⚠️  Warning: Saving images will significantly slow down processing")
+        save_warning.setStyleSheet("color: #FF9800; font-size: 10px; font-weight: bold;")
+        svo_options_layout.addWidget(save_warning)
+        
+        # Preview option
+        self.show_preview_check = QCheckBox("Show live preview (when saving images)")
+        self.show_preview_check.setChecked(True)
+        self.show_preview_check.setEnabled(False)  # Enabled only when save_images is checked
+        svo_options_layout.addWidget(self.show_preview_check)
+        
+        self.svo_options_group.setLayout(svo_options_layout)
+        self.svo_options_group.setVisible(False)  # Hidden for Pure Inference
+        setup_layout.addWidget(self.svo_options_group)
+        
+        # Run/Load buttons
+        self.run_btn = QPushButton("▶ Run Benchmark")
         self.run_btn.setStyleSheet("background-color: #4CAF50; color: white; font-size: 16px; padding: 15px;")
-        self.run_btn.clicked.connect(self._run_inference)
+        self.run_btn.clicked.connect(self._run_benchmark)
         setup_layout.addWidget(self.run_btn)
+        
+        # SVO2-specific: Load button (appears after SVO loaded)
+        self.svo_load_btn = QPushButton("🔄 Initialize SVO2 File")
+        self.svo_load_btn.setStyleSheet("background-color: #2196F3; color: white; font-size: 14px; padding: 12px;")
+        self.svo_load_btn.clicked.connect(self._load_svo)
+        self.svo_load_btn.setVisible(False)
+        setup_layout.addWidget(self.svo_load_btn)
+        
+        # SVO2-specific: Start button (appears after loading complete)
+        self.svo_start_btn = QPushButton("▶ Start Processing")
+        self.svo_start_btn.setStyleSheet("background-color: #4CAF50; color: white; font-size: 16px; padding: 15px;")
+        self.svo_start_btn.clicked.connect(self._start_svo_processing)
+        self.svo_start_btn.setVisible(False)
+        self.svo_start_btn.setEnabled(False)
+        setup_layout.addWidget(self.svo_start_btn)
         
         # Load previous run button
         self.load_prev_btn = QPushButton("📂 Load Previous Run for Validation")
@@ -683,6 +937,18 @@ class JetsonBenchmarkApp(QMainWindow):
         setup_layout.addWidget(self.load_prev_btn)
         
         main_layout.addWidget(self.setup_widget)
+        
+        # Preview window (for SVO2 with save images)
+        self.preview_group = QGroupBox("Live Preview")
+        preview_layout = QVBoxLayout()
+        self.preview_label = QLabel("No preview available")
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setMinimumSize(640, 360)
+        self.preview_label.setStyleSheet("background-color: #000; color: #fff;")
+        preview_layout.addWidget(self.preview_label)
+        self.preview_group.setLayout(preview_layout)
+        self.preview_group.setVisible(False)
+        main_layout.addWidget(self.preview_group)
         
         # Output area
         output_group = QGroupBox("Output")
@@ -694,7 +960,257 @@ class JetsonBenchmarkApp(QMainWindow):
         output_group.setLayout(output_layout)
         main_layout.addWidget(output_group)
         
-        self.output_text.append("Ready. Select engine and test folder to begin.")
+        self.output_text.append("Ready. Select scenario, engine, and input to begin.")
+        
+        # Initialize with Pure Inference mode
+        self._on_scenario_changed(0)
+        
+        # Track SVO worker
+        self.svo_worker = None
+        self.svo_loaded = False
+    
+    def _on_scenario_changed(self, index: int):
+        """Handle scenario selection change."""
+        is_svo = (index == 1)  # 0 = Pure Inference, 1 = SVO2 Pipeline
+        
+        # Update UI labels
+        if is_svo:
+            self.test_group.setTitle("3. Select SVO2 File")
+            self.test_folder_edit.setPlaceholderText("Path to .svo2 file...")
+        else:
+            self.test_group.setTitle("3. Select Test Images Folder")
+            self.test_folder_edit.setPlaceholderText("Path to test images folder...")
+        
+        # Show/hide appropriate widgets
+        self.images_group.setVisible(not is_svo)
+        self.svo_options_group.setVisible(is_svo)
+        self.image_count_label.setVisible(not is_svo)
+        self.svo_info_label.setVisible(is_svo)
+        
+        # Show/hide appropriate buttons
+        self.run_btn.setVisible(not is_svo)
+        self.svo_load_btn.setVisible(is_svo)
+        self.svo_start_btn.setVisible(is_svo)
+        
+        # Clear input field when switching
+        self.test_folder_edit.clear()
+        
+        # Reset SVO state
+        self.svo_loaded = False
+        self.svo_start_btn.setEnabled(False)
+    
+    def _browse_input(self):
+        """Browse for input (folder or SVO file depending on scenario)."""
+        is_svo = (self.scenario_combo.currentIndex() == 1)
+        
+        if is_svo:
+            file_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select SVO2 File",
+                str(Path.home()),
+                "SVO2 Files (*.svo2 *.svo)"
+            )
+            if file_path:
+                self.test_folder_edit.setText(file_path)
+                self._update_svo_info(Path(file_path))
+        else:
+            self._browse_test_folder()
+    
+    def _update_svo_info(self, svo_path: Path):
+        """Display info about selected SVO2 file."""
+        if svo_path.exists():
+            size_mb = svo_path.stat().st_size / (1024 * 1024)
+            self.svo_info_label.setText(f"📹 SVO2 file: {svo_path.name} ({size_mb:.1f} MB)")
+        else:
+            self.svo_info_label.setText("⚠ Invalid SVO2 file")
+    
+    def _on_save_images_toggled(self, checked: bool):
+        """Enable/disable preview option based on save images."""
+        self.show_preview_check.setEnabled(checked)
+        if checked:
+            self.show_preview_check.setChecked(True)
+    
+    def _load_svo(self):
+        """Initialize SVO2 file (loading phase)."""
+        engine_path = Path(self.engine_edit.text().strip())
+        svo_path = Path(self.test_folder_edit.text().strip())
+        
+        if not engine_path.exists():
+            QMessageBox.warning(self, "Error", "Please select a valid TensorRT engine file")
+            return
+        
+        if not svo_path.exists():
+            QMessageBox.warning(self, "Error", "Please select a valid SVO2 file")
+            return
+        
+        # Create benchmark run folder
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_folder = Path.home() / "jetson_benchmarks" / f"svo_run_{timestamp}"
+        run_folder.mkdir(parents=True, exist_ok=True)
+        
+        self.run_folder = run_folder
+        
+        self.output_text.append("\n" + "=" * 70)
+        self.output_text.append("🎬 SVO2 PIPELINE BENCHMARK")
+        self.output_text.append("=" * 70)
+        self.output_text.append(f"📹 SVO2 File: {svo_path.name}")
+        self.output_text.append(f"🤖 Engine: {engine_path.name}")
+        self.output_text.append(f"📁 Output: {run_folder}")
+        self.output_text.append("\n⏳ Loading SVO2 file with NEURAL_PLUS depth...")
+        self.output_text.append("   This can take 30-60 seconds for initialization...")
+        
+        # Disable UI during loading
+        self.svo_load_btn.setEnabled(False)
+        self.svo_start_btn.setEnabled(False)
+        
+        # Show progress dialog
+        self.loading_dialog = QProgressDialog("Initializing SVO2 file...", "Cancel", 0, 100, self)
+        self.loading_dialog.setWindowTitle("Loading SVO2")
+        self.loading_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self.loading_dialog.setMinimumDuration(0)
+        self.loading_dialog.show()
+        
+        # Create worker
+        save_images = self.save_images_check.isChecked()
+        self.svo_worker = SVOScenarioWorker(engine_path, svo_path, run_folder, 
+                                            conf_threshold=0.25, save_images=save_images)
+        self.svo_worker.loading_progress.connect(self._on_svo_loading_progress)
+        self.svo_worker.loading_complete.connect(self._on_svo_loading_complete)
+        self.svo_worker.loading_failed.connect(self._on_svo_loading_failed)
+        self.svo_worker.start()
+    
+    def _on_svo_loading_progress(self, progress: int, message: str):
+        """Handle SVO loading progress."""
+        self.loading_dialog.setValue(progress)
+        self.loading_dialog.setLabelText(message)
+        self.output_text.append(f"   [{progress}%] {message}")
+    
+    def _on_svo_loading_complete(self):
+        """Handle SVO loading completion."""
+        self.loading_dialog.close()
+        self.svo_loaded = True
+        self.svo_start_btn.setEnabled(True)
+        
+        self.output_text.append("\n✅ SVO2 file loaded successfully!")
+        self.output_text.append(f"📊 Total frames: {self.svo_worker.scenario.total_frames}")
+        self.output_text.append("\n👉 Click 'Start Processing' to begin benchmark")
+        
+        QMessageBox.information(
+            self,
+            "SVO2 Ready",
+            f"SVO2 file loaded successfully!\n\n"
+            f"Total frames: {self.svo_worker.scenario.total_frames}\n\n"
+            f"Click 'Start Processing' to begin the benchmark."
+        )
+    
+    def _on_svo_loading_failed(self, error_msg: str):
+        """Handle SVO loading failure."""
+        self.loading_dialog.close()
+        self.svo_load_btn.setEnabled(True)
+        self.output_text.append(f"\n❌ Loading failed: {error_msg}")
+        QMessageBox.critical(self, "Loading Failed", f"Failed to load SVO2 file:\n\n{error_msg}")
+    
+    def _start_svo_processing(self):
+        """Start SVO2 processing after loading complete."""
+        if not self.svo_loaded or not self.svo_worker:
+            QMessageBox.warning(self, "Error", "SVO2 file not loaded")
+            return
+        
+        self.output_text.append("\n🚀 Starting SVO2 processing...")
+        
+        # Show preview if enabled
+        if self.save_images_check.isChecked() and self.show_preview_check.isChecked():
+            self.preview_group.setVisible(True)
+            self.svo_worker.frame_processed.connect(self._on_frame_preview)
+        
+        # Disable buttons during processing
+        self.svo_start_btn.setEnabled(False)
+        self.svo_load_btn.setEnabled(False)
+        
+        # Connect remaining signals
+        self.svo_worker.progress_updated.connect(self._on_svo_progress)
+        self.svo_worker.benchmark_complete.connect(self._on_svo_benchmark_complete)
+        self.svo_worker.benchmark_failed.connect(self._on_svo_benchmark_failed)
+        
+        # Emit signal to start benchmark phase in worker thread
+        self.svo_worker.start_processing.emit()
+    
+    def _on_svo_progress(self, current: int, total: int, status: str, fps: float):
+        """Handle SVO processing progress."""
+        self.statusBar().showMessage(f"{status} | FPS: {fps:.1f}")
+        if current % 10 == 0:  # Log every 10 frames
+            self.output_text.append(f"   {status} | FPS: {fps:.1f}")
+    
+    def _on_frame_preview(self, img_rgb):
+        """Update preview with latest processed frame."""
+        import numpy as np
+        
+        # Convert numpy array to QPixmap
+        height, width, channel = img_rgb.shape
+        bytes_per_line = 3 * width
+        q_image = QImage(img_rgb.data, width, height, bytes_per_line, QImage.Format.Format_RGB888)
+        pixmap = QPixmap.fromImage(q_image)
+        
+        # Scale to fit preview
+        scaled = pixmap.scaled(self.preview_label.size(), Qt.AspectRatioMode.KeepAspectRatio, 
+                               Qt.TransformationMode.SmoothTransformation)
+        self.preview_label.setPixmap(scaled)
+    
+    def _on_svo_benchmark_complete(self, run_folder: str, total_time: float, stats: dict):
+        """Handle SVO benchmark completion."""
+        self.svo_start_btn.setEnabled(False)
+        self.svo_load_btn.setEnabled(True)
+        self.preview_group.setVisible(False)
+        
+        self.output_text.append(f"\n✅ Benchmark complete in {total_time:.1f}s")
+        self.output_text.append("\n" + "-" * 70)
+        self.output_text.append("SVO2 PIPELINE STATISTICS:")
+        self.output_text.append(f"  Total Frames: {stats['total_frames']}")
+        self.output_text.append(f"  Frames w/ Detections: {stats['frames_with_detections']}")
+        self.output_text.append(f"  Frames Empty: {stats['frames_empty']}")
+        self.output_text.append(f"  Total Detections: {stats['total_detections']}")
+        self.output_text.append(f"  Avg Detections per Frame: {stats['avg_detections_per_frame']:.2f}")
+        self.output_text.append(f"  Mean FPS: {stats['mean_fps']:.2f}")
+        self.output_text.append(f"  Mean Latency: {stats['mean_latency_ms']:.2f} ms")
+        self.output_text.append("\nCOMPONENT TIMING BREAKDOWN:")
+        for component, time_ms in stats['component_times_ms'].items():
+            self.output_text.append(f"  {component.capitalize()}: {time_ms:.2f} ms")
+        self.output_text.append("-" * 70)
+        
+        if stats.get('images_saved'):
+            self.output_text.append(f"💾 Saved frames to: {Path(run_folder) / 'frames'}")
+        
+        self.statusBar().showMessage(f"Benchmark complete - {stats['mean_fps']:.2f} FPS")
+        
+        # Show summary
+        component_summary = "\n".join([f"  {k}: {v:.2f} ms" for k, v in stats['component_times_ms'].items()])
+        QMessageBox.information(
+            self,
+            "Benchmark Complete",
+            f"SVO2 Pipeline benchmark completed!\n\n"
+            f"Processed {stats['total_frames']} frames in {total_time:.1f}s\n"
+            f"Mean FPS: {stats['mean_fps']:.2f}\n"
+            f"Mean Latency: {stats['mean_latency_ms']:.2f} ms\n\n"
+            f"Component Breakdown:\n{component_summary}"
+        )
+    
+    def _on_svo_benchmark_failed(self, error_msg: str):
+        """Handle SVO benchmark failure."""
+        self.svo_start_btn.setEnabled(True)
+        self.svo_load_btn.setEnabled(True)
+        self.preview_group.setVisible(False)
+        self.output_text.append(f"\n❌ Benchmark failed: {error_msg}")
+        self.statusBar().showMessage("Benchmark failed")
+        QMessageBox.critical(self, "Benchmark Failed", error_msg)
+    
+    def _run_benchmark(self):
+        """Dispatch to appropriate benchmark method based on scenario."""
+        is_svo = (self.scenario_combo.currentIndex() == 1)
+        
+        if is_svo:
+            self._load_svo()
+        else:
+            self._run_inference()
     
     def _browse_engine(self):
         """Browse for TensorRT engine file."""

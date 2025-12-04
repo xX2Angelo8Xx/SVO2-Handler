@@ -66,6 +66,16 @@ def build_tensorrt_engine(
     Returns:
         True if successful, False otherwise
     """
+    # ⚡ cuDNN Workaround: Disable cuDNN during export
+    # This avoids cuDNN 8/9 compatibility issues on Jetson
+    import os
+    os.environ['PYTORCH_CUDNN_BENCHMARK'] = '0'
+    
+    import torch
+    torch.backends.cudnn.enabled = False
+    print("⚡ cuDNN disabled for export (using CUDA fallback)")
+    print()
+    
     try:
         from ultralytics import YOLO
     except ImportError:

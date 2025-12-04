@@ -28,10 +28,90 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QFileDialog, QTextEdit,
     QGroupBox, QMessageBox, QProgressDialog, QScrollArea, QSpinBox, QCheckBox,
-    QStackedWidget, QComboBox
+    QStackedWidget, QComboBox, QProgressBar, QSizePolicy
 )
 from PySide6.QtCore import Qt, QThread, Signal, QSize
 from PySide6.QtGui import QFont, QPixmap, QImage, QPainter, QPen, QColor, QBrush
+
+# Matplotlib for depth plot
+try:
+    import matplotlib
+    matplotlib.use('Qt5Agg')
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+    from matplotlib.figure import Figure
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    print("Warning: matplotlib not available, depth plot disabled")
+
+
+class DepthPlotCanvas(FigureCanvasQTAgg if MATPLOTLIB_AVAILABLE else QWidget):
+    """Canvas for plotting depth over time."""
+    
+    def __init__(self, parent=None):
+        if MATPLOTLIB_AVAILABLE:
+            self.fig = Figure(figsize=(5, 3), dpi=100)
+            self.fig.patch.set_facecolor('#f0f0f0')
+            super().__init__(self.fig)
+            self.axes = self.fig.add_subplot(111)
+            self.axes.set_facecolor('#ffffff')
+            self.axes.set_xlabel('Frame', fontsize=9)
+            self.axes.set_ylabel('Depth (m)', fontsize=9)
+            self.axes.set_title('Mean Depth (Last 30 Frames)', fontsize=10)
+            self.axes.grid(True, alpha=0.3)
+            self.axes.tick_params(labelsize=8)
+            self.fig.tight_layout()
+            
+            self.depth_data = []
+            self.max_points = 30
+        else:
+            super().__init__(parent)
+            layout = QVBoxLayout(self)
+            label = QLabel("Matplotlib not available")
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(label)
+    
+    def update_plot(self, depth_value: float):
+        """Update plot with new depth value."""
+        if not MATPLOTLIB_AVAILABLE:
+            return
+        
+        self.depth_data.append(depth_value if depth_value > 0 else 0)
+        if len(self.depth_data) > self.max_points:
+            self.depth_data.pop(0)
+        
+        self.axes.clear()
+        self.axes.set_facecolor('#ffffff')
+        self.axes.set_xlabel('Frame', fontsize=9)
+        self.axes.set_ylabel('Depth (m)', fontsize=9)
+        self.axes.set_title('Mean Depth (Last 30 Frames)', fontsize=10, fontweight='bold')
+        self.axes.grid(True, alpha=0.3)
+        self.axes.tick_params(labelsize=8)
+        
+        if self.depth_data:
+            x = list(range(len(self.depth_data)))
+            self.axes.plot(x, self.depth_data, 'b-', linewidth=2, marker='o', markersize=4)
+            self.axes.fill_between(x, 0, self.depth_data, alpha=0.3)
+            
+            # Set y-axis limits
+            max_depth = max(self.depth_data) if self.depth_data else 40
+            self.axes.set_ylim(0, min(max_depth * 1.2, 45))
+        
+        self.fig.tight_layout()
+        self.draw()
+    
+    def clear_plot(self):
+        """Clear all data."""
+        if MATPLOTLIB_AVAILABLE:
+            self.depth_data = []
+            self.axes.clear()
+            self.axes.set_xlabel('Frame', fontsize=9)
+            self.axes.set_ylabel('Depth (m)', fontsize=9)
+            self.axes.set_title('Mean Depth (Last 30 Frames)', fontsize=10)
+            self.axes.grid(True, alpha=0.3)
+            self.fig.tight_layout()
+            self.draw()
 
 
 @dataclass
@@ -198,7 +278,7 @@ class SVOScenarioWorker(QThread):
     loading_complete = Signal()  # SVO loaded and ready
     loading_failed = Signal(str)  # error message
     
-    progress_updated = Signal(int, int, str, float)  # current, total, status, fps
+    progress_updated = Signal(int, int, str, float, int, float)  # current, total, status, fps, num_objects, mean_depth
     frame_processed = Signal(object)  # preview image (numpy RGB array)
     benchmark_complete = Signal(str, float, dict)  # run_folder, total_time, stats
     benchmark_failed = Signal(str)  # error message
@@ -318,7 +398,12 @@ class SVOScenarioWorker(QThread):
                     continue
                 
                 frames_processed += 1
-                detection_counts.append(len(result.get('detections', [])))
+                detections = result.get('detections', [])
+                detection_counts.append(len(detections))
+                
+                # Get mean depth from detections
+                depths = [d.get('depth_mean', -1) for d in detections if d.get('depth_mean', -1) > 0]
+                mean_depth = sum(depths) / len(depths) if depths else -1.0
                 
                 # Accumulate timings
                 for key, value in result.get('timings', {}).items():
@@ -329,9 +414,9 @@ class SVOScenarioWorker(QThread):
                 frame_time = time.time() - frame_start
                 fps = 1.0 / frame_time if frame_time > 0 else 0
                 
-                # Update progress
+                # Update progress with detection info
                 status = f"Frame {frames_processed}/{total_frames}"
-                self.progress_updated.emit(frames_processed, total_frames, status, fps)
+                self.progress_updated.emit(frames_processed, total_frames, status, fps, len(detections), mean_depth)
             
             if self._cancelled:
                 self.scenario.cleanup()
@@ -786,26 +871,31 @@ class JetsonBenchmarkApp(QMainWindow):
         self._build_ui()
     
     def _build_ui(self):
-        """Build the main UI."""
+        """Build the main UI with side-by-side layout."""
         # Create main widget
         self.main_widget = QWidget()
         main_layout = QVBoxLayout(self.main_widget)
+        main_layout.setContentsMargins(10, 10, 10, 10)
         
         # Add to stacked widget
         self.stacked_widget.addWidget(self.main_widget)
         
         # Title
         title = QLabel("Jetson YOLO Benchmark & Validation Tool")
-        title.setFont(QFont("Arial", 16, QFont.Weight.Bold))
+        title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         main_layout.addWidget(title)
         
-        # Setup widget (hidden during validation)
-        self.setup_widget = QWidget()
-        setup_layout = QVBoxLayout(self.setup_widget)
+        # Main horizontal split: Left (Controls) | Right (Preview + Stats)
+        content_layout = QHBoxLayout()
+        
+        # ===== LEFT SIDE: Controls =====
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_widget.setMaximumWidth(500)
         
         # Scenario selection
-        scenario_group = QGroupBox("1. Select Benchmark Scenario")
+        scenario_group = QGroupBox("1. Benchmark Scenario")
         scenario_layout = QVBoxLayout()
         self.scenario_combo = QComboBox()
         self.scenario_combo.addItems([
@@ -814,54 +904,49 @@ class JetsonBenchmarkApp(QMainWindow):
         ])
         self.scenario_combo.currentIndexChanged.connect(self._on_scenario_changed)
         scenario_layout.addWidget(self.scenario_combo)
-        
-        scenario_desc = QLabel("Pure Inference: Baseline TensorRT on images\n"
-                              "SVO2 Pipeline: Full pipeline with depth extraction (NEURAL_PLUS)")
-        scenario_desc.setStyleSheet("color: #666; font-size: 10px; font-style: italic;")
-        scenario_layout.addWidget(scenario_desc)
         scenario_group.setLayout(scenario_layout)
-        setup_layout.addWidget(scenario_group)
+        left_layout.addWidget(scenario_group)
         
         # Engine file selection
-        engine_group = QGroupBox("2. Select TensorRT Engine")
+        engine_group = QGroupBox("2. TensorRT Engine")
         engine_layout = QHBoxLayout()
         self.engine_edit = QLineEdit()
         self.engine_edit.setPlaceholderText("Path to .engine file...")
         engine_browse_btn = QPushButton("Browse")
         engine_browse_btn.clicked.connect(self._browse_engine)
+        engine_browse_btn.setMaximumWidth(80)
         engine_layout.addWidget(self.engine_edit)
         engine_layout.addWidget(engine_browse_btn)
         engine_group.setLayout(engine_layout)
-        setup_layout.addWidget(engine_group)
+        left_layout.addWidget(engine_group)
         
-        # Test folder/SVO file selection (dynamic based on scenario)
-        self.test_group = QGroupBox("3. Select Input")
-        self.test_layout = QVBoxLayout()
-        folder_layout = QHBoxLayout()
+        # Input selection
+        self.test_group = QGroupBox("3. Input File/Folder")
+        test_layout = QVBoxLayout()
+        input_layout = QHBoxLayout()
         self.test_folder_edit = QLineEdit()
         self.test_folder_edit.textChanged.connect(self._on_folder_changed)
         self.test_browse_btn = QPushButton("Browse")
         self.test_browse_btn.clicked.connect(self._browse_input)
-        folder_layout.addWidget(self.test_folder_edit)
-        folder_layout.addWidget(self.test_browse_btn)
-        self.test_layout.addLayout(folder_layout)
+        self.test_browse_btn.setMaximumWidth(80)
+        input_layout.addWidget(self.test_folder_edit)
+        input_layout.addWidget(self.test_browse_btn)
+        test_layout.addLayout(input_layout)
         
-        # Image count label (for Pure Inference only)
         self.image_count_label = QLabel("")
-        self.image_count_label.setStyleSheet("color: #2196F3; font-size: 11px;")
-        self.test_layout.addWidget(self.image_count_label)
+        self.image_count_label.setStyleSheet("color: #2196F3; font-size: 10px;")
+        test_layout.addWidget(self.image_count_label)
         
-        # SVO info label (for SVO2 Pipeline only)
         self.svo_info_label = QLabel("")
-        self.svo_info_label.setStyleSheet("color: #2196F3; font-size: 11px;")
+        self.svo_info_label.setStyleSheet("color: #2196F3; font-size: 10px;")
         self.svo_info_label.setVisible(False)
-        self.test_layout.addWidget(self.svo_info_label)
+        test_layout.addWidget(self.svo_info_label)
         
-        self.test_group.setLayout(self.test_layout)
-        setup_layout.addWidget(self.test_group)
+        self.test_group.setLayout(test_layout)
+        left_layout.addWidget(self.test_group)
         
-        # Max images selection (for Pure Inference only)
-        self.images_group = QGroupBox("4. Number of Images to Test")
+        # Options (conditional based on scenario)
+        self.images_group = QGroupBox("4. Options")
         images_layout = QVBoxLayout()
         
         images_control_layout = QHBoxLayout()
@@ -869,85 +954,150 @@ class JetsonBenchmarkApp(QMainWindow):
         self.max_images_spin.setRange(1, 10000)
         self.max_images_spin.setValue(200)
         self.max_images_spin.setSuffix(" images")
-        images_control_layout.addWidget(QLabel("Max Images:"))
+        images_control_layout.addWidget(QLabel("Max:"))
         images_control_layout.addWidget(self.max_images_spin)
-        images_control_layout.addStretch()
         
-        self.use_all_check = QCheckBox("Use all images")
+        self.use_all_check = QCheckBox("Use all")
         self.use_all_check.toggled.connect(self._toggle_max_images)
         images_control_layout.addWidget(self.use_all_check)
+        images_control_layout.addStretch()
         
         images_layout.addLayout(images_control_layout)
-        
-        note_label = QLabel("Note: Images are RANDOMLY SELECTED for unbiased sampling")
-        note_label.setStyleSheet("color: #666; font-size: 10px; font-style: italic;")
-        images_layout.addWidget(note_label)
-        
         self.images_group.setLayout(images_layout)
-        setup_layout.addWidget(self.images_group)
+        left_layout.addWidget(self.images_group)
         
-        # Save images option (for SVO2 Pipeline only)
-        self.svo_options_group = QGroupBox("4. SVO2 Processing Options")
+        # SVO2 options
+        self.svo_options_group = QGroupBox("4. Options")
         svo_options_layout = QVBoxLayout()
         
-        self.save_images_check = QCheckBox("Save processed frames (raw + annotated)")
+        self.save_images_check = QCheckBox("Save annotated frames")
         self.save_images_check.setChecked(False)
         self.save_images_check.toggled.connect(self._on_save_images_toggled)
         svo_options_layout.addWidget(self.save_images_check)
         
-        save_warning = QLabel("⚠️  Warning: Saving images will significantly slow down processing")
-        save_warning.setStyleSheet("color: #FF9800; font-size: 10px; font-weight: bold;")
-        svo_options_layout.addWidget(save_warning)
-        
-        # Preview option
-        self.show_preview_check = QCheckBox("Show live preview (when saving images)")
+        self.show_preview_check = QCheckBox("Show live preview")
         self.show_preview_check.setChecked(True)
-        self.show_preview_check.setEnabled(False)  # Enabled only when save_images is checked
+        self.show_preview_check.setEnabled(False)
         svo_options_layout.addWidget(self.show_preview_check)
         
         self.svo_options_group.setLayout(svo_options_layout)
-        self.svo_options_group.setVisible(False)  # Hidden for Pure Inference
-        setup_layout.addWidget(self.svo_options_group)
+        self.svo_options_group.setVisible(False)
+        left_layout.addWidget(self.svo_options_group)
         
-        # Run/Load buttons
+        # Control buttons
         self.run_btn = QPushButton("▶ Run Benchmark")
-        self.run_btn.setStyleSheet("background-color: #4CAF50; color: white; font-size: 16px; padding: 15px;")
+        self.run_btn.setStyleSheet("background-color: #4CAF50; color: white; font-size: 13px; padding: 12px;")
         self.run_btn.clicked.connect(self._run_benchmark)
-        setup_layout.addWidget(self.run_btn)
+        left_layout.addWidget(self.run_btn)
         
-        # SVO2-specific: Load button (appears after SVO loaded)
-        self.svo_load_btn = QPushButton("🔄 Initialize SVO2 File")
-        self.svo_load_btn.setStyleSheet("background-color: #2196F3; color: white; font-size: 14px; padding: 12px;")
+        self.svo_load_btn = QPushButton("🔄 Initialize SVO2")
+        self.svo_load_btn.setStyleSheet("background-color: #2196F3; color: white; font-size: 12px; padding: 10px;")
         self.svo_load_btn.clicked.connect(self._load_svo)
         self.svo_load_btn.setVisible(False)
-        setup_layout.addWidget(self.svo_load_btn)
+        left_layout.addWidget(self.svo_load_btn)
         
-        # SVO2-specific: Start button (appears after loading complete)
         self.svo_start_btn = QPushButton("▶ Start Processing")
-        self.svo_start_btn.setStyleSheet("background-color: #4CAF50; color: white; font-size: 16px; padding: 15px;")
+        self.svo_start_btn.setStyleSheet("background-color: #4CAF50; color: white; font-size: 13px; padding: 12px;")
         self.svo_start_btn.clicked.connect(self._start_svo_processing)
         self.svo_start_btn.setVisible(False)
         self.svo_start_btn.setEnabled(False)
-        setup_layout.addWidget(self.svo_start_btn)
+        left_layout.addWidget(self.svo_start_btn)
         
-        # Load previous run button
-        self.load_prev_btn = QPushButton("📂 Load Previous Run for Validation")
-        self.load_prev_btn.setStyleSheet("background-color: #757575; color: white; font-size: 12px; padding: 10px;")
+        self.load_prev_btn = QPushButton("📂 Load Previous Run")
+        self.load_prev_btn.setStyleSheet("background-color: #757575; color: white; font-size: 11px; padding: 8px;")
         self.load_prev_btn.clicked.connect(self._load_previous_run)
-        setup_layout.addWidget(self.load_prev_btn)
+        left_layout.addWidget(self.load_prev_btn)
         
-        main_layout.addWidget(self.setup_widget)
+        left_layout.addStretch()
         
-        # Preview window (for SVO2 with save images)
-        self.preview_group = QGroupBox("Live Preview")
+        content_layout.addWidget(left_widget)
+        
+        # ===== RIGHT SIDE: Preview + Statistics =====
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(5, 0, 0, 0)
+        
+        # Preview window
+        preview_group = QGroupBox("Live Preview")
         preview_layout = QVBoxLayout()
-        self.preview_label = QLabel("No preview available")
+        self.preview_label = QLabel("No preview")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setMinimumSize(640, 360)
-        self.preview_label.setStyleSheet("background-color: #000; color: #fff;")
+        self.preview_label.setMinimumSize(480, 270)
+        self.preview_label.setMaximumSize(640, 360)
+        self.preview_label.setStyleSheet("background-color: #000; color: #666;")
+        self.preview_label.setScaledContents(False)
         preview_layout.addWidget(self.preview_label)
-        self.preview_group.setLayout(preview_layout)
-        self.preview_group.setVisible(False)
+        preview_group.setLayout(preview_layout)
+        right_layout.addWidget(preview_group)
+        
+        # Statistics panel
+        stats_group = QGroupBox("Statistics")
+        stats_layout = QVBoxLayout()
+        
+        # Progress bar
+        progress_layout = QHBoxLayout()
+        progress_layout.addWidget(QLabel("Progress:"))
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        progress_layout.addWidget(self.progress_bar)
+        stats_layout.addLayout(progress_layout)
+        
+        # Metrics in grid
+        metrics_layout = QHBoxLayout()
+        
+        # Column 1
+        col1_layout = QVBoxLayout()
+        self.fps_label = QLabel("FPS: --")
+        self.fps_label.setStyleSheet("font-weight: bold; font-size: 12px;")
+        col1_layout.addWidget(self.fps_label)
+        
+        self.frame_label = QLabel("Frame: -- / --")
+        self.frame_label.setStyleSheet("font-size: 11px;")
+        col1_layout.addWidget(self.frame_label)
+        metrics_layout.addLayout(col1_layout)
+        
+        # Column 2
+        col2_layout = QVBoxLayout()
+        self.objects_label = QLabel("Objects: --")
+        self.objects_label.setStyleSheet("font-weight: bold; font-size: 12px;")
+        col2_layout.addWidget(self.objects_label)
+        
+        self.depth_label = QLabel("Depth: -- m")
+        self.depth_label.setStyleSheet("font-size: 11px;")
+        col2_layout.addWidget(self.depth_label)
+        metrics_layout.addLayout(col2_layout)
+        
+        stats_layout.addLayout(metrics_layout)
+        
+        # Depth plot
+        self.depth_plot = DepthPlotCanvas()
+        self.depth_plot.setMinimumHeight(200)
+        self.depth_plot.setMaximumHeight(250)
+        stats_layout.addWidget(self.depth_plot)
+        
+        stats_group.setLayout(stats_layout)
+        right_layout.addWidget(stats_group)
+        
+        right_layout.addStretch()
+        
+        content_layout.addWidget(right_widget, stretch=1)
+        
+        main_layout.addLayout(content_layout)
+        
+        # Output log at bottom (collapsible)
+        output_group = QGroupBox("Console Output")
+        output_group.setMaximumHeight(150)
+        output_layout = QVBoxLayout()
+        self.output_text = QTextEdit()
+        self.output_text.setReadOnly(True)
+        self.output_text.setMaximumHeight(120)
+        output_layout.addWidget(self.output_text)
+        output_group.setLayout(output_layout)
+        main_layout.addWidget(output_group)
+        
+        self.output_text.append("Ready. Select scenario and configure settings.")
         main_layout.addWidget(self.preview_group)
         
         # Output area
@@ -1118,9 +1268,16 @@ class JetsonBenchmarkApp(QMainWindow):
         
         self.output_text.append("\n🚀 Starting SVO2 processing...")
         
-        # Show preview if enabled
+        # Reset statistics
+        self.progress_bar.setValue(0)
+        self.fps_label.setText("FPS: --")
+        self.frame_label.setText("Frame: -- / --")
+        self.objects_label.setText("Objects: --")
+        self.depth_label.setText("Depth: -- m")
+        self.depth_plot.clear_plot()
+        
+        # Connect preview if enabled
         if self.save_images_check.isChecked() and self.show_preview_check.isChecked():
-            self.preview_group.setVisible(True)
             self.svo_worker.frame_processed.connect(self._on_frame_preview)
         
         # Disable buttons during processing
@@ -1135,11 +1292,31 @@ class JetsonBenchmarkApp(QMainWindow):
         # Emit signal to start benchmark phase in worker thread
         self.svo_worker.start_processing.emit()
     
-    def _on_svo_progress(self, current: int, total: int, status: str, fps: float):
-        """Handle SVO processing progress."""
-        self.statusBar().showMessage(f"{status} | FPS: {fps:.1f}")
-        if current % 10 == 0:  # Log every 10 frames
-            self.output_text.append(f"   {status} | FPS: {fps:.1f}")
+    def _on_svo_progress(self, current: int, total: int, status: str, fps: float, num_objects: int, mean_depth: float):
+        """Handle SVO processing progress with detailed stats."""
+        # Update status bar
+        self.statusBar().showMessage(f"{status} | FPS: {fps:.1f} | Objects: {num_objects}")
+        
+        # Update progress bar
+        progress_pct = int((current / total) * 100) if total > 0 else 0
+        self.progress_bar.setValue(progress_pct)
+        self.progress_bar.setFormat(f"{current}/{total} ({progress_pct}%)")
+        
+        # Update metrics
+        self.fps_label.setText(f"FPS: {fps:.1f}")
+        self.frame_label.setText(f"Frame: {current} / {total}")
+        self.objects_label.setText(f"Objects: {num_objects}")
+        
+        if mean_depth > 0:
+            self.depth_label.setText(f"Depth: {mean_depth:.2f} m")
+            self.depth_plot.update_plot(mean_depth)
+        else:
+            self.depth_label.setText("Depth: No data")
+        
+        # Log every 10 frames
+        if current % 10 == 0:
+            self.output_text.append(f"   {status} | FPS: {fps:.1f} | Obj: {num_objects}")
+
     
     def _on_frame_preview(self, img_rgb):
         """Update preview with latest processed frame."""
@@ -1151,8 +1328,9 @@ class JetsonBenchmarkApp(QMainWindow):
         q_image = QImage(img_rgb.data, width, height, bytes_per_line, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(q_image)
         
-        # Scale to fit preview
-        scaled = pixmap.scaled(self.preview_label.size(), Qt.AspectRatioMode.KeepAspectRatio, 
+        # Scale to fit preview label while maintaining aspect ratio
+        scaled = pixmap.scaled(self.preview_label.width(), self.preview_label.height(), 
+                               Qt.AspectRatioMode.KeepAspectRatio, 
                                Qt.TransformationMode.SmoothTransformation)
         self.preview_label.setPixmap(scaled)
     
@@ -1160,7 +1338,6 @@ class JetsonBenchmarkApp(QMainWindow):
         """Handle SVO benchmark completion."""
         self.svo_start_btn.setEnabled(False)
         self.svo_load_btn.setEnabled(True)
-        self.preview_group.setVisible(False)
         
         self.output_text.append(f"\n✅ Benchmark complete in {total_time:.1f}s")
         self.output_text.append("\n" + "-" * 70)
@@ -1198,7 +1375,6 @@ class JetsonBenchmarkApp(QMainWindow):
         """Handle SVO benchmark failure."""
         self.svo_start_btn.setEnabled(True)
         self.svo_load_btn.setEnabled(True)
-        self.preview_group.setVisible(False)
         self.output_text.append(f"\n❌ Benchmark failed: {error_msg}")
         self.statusBar().showMessage("Benchmark failed")
         QMessageBox.critical(self, "Benchmark Failed", error_msg)

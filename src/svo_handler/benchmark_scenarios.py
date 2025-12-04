@@ -476,15 +476,10 @@ class SVOPipelineScenario(BenchmarkScenario):
                 cv2.putText(annotated_img, label, (x1, y1 - 5), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             
-            # Save annotated image
-            frame_filename = f"frame_{self.frame_index:06d}_annotated.jpg"
+            # Save annotated image only (skip raw for speed)
+            frame_filename = f"frame_{self.frame_index:06d}.jpg"
             save_path = Path(self.output_dir) / frame_filename
             cv2.imwrite(str(save_path), annotated_img)
-            
-            # Also save raw frame
-            raw_filename = f"frame_{self.frame_index:06d}_raw.jpg"
-            raw_path = Path(self.output_dir) / raw_filename
-            cv2.imwrite(str(raw_path), img_bgr)
             
             timings['save'] = (time.time() - save_start) * 1000
             

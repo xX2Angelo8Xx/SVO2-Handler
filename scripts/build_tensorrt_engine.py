@@ -116,11 +116,21 @@ def build_tensorrt_engine(
         # Load PyTorch model
         model = YOLO(str(pt_path))
         
+        # Get model's input size from metadata
+        # Default to 640 if not found (standard YOLO size)
+        try:
+            imgsz = model.model.args.get('imgsz', 640)
+        except (AttributeError, KeyError):
+            imgsz = 640
+        
+        print(f"Using image size: {imgsz}")
+        print()
+        
         # Export to TensorRT
         # Ultralytics will automatically build the engine
         model.export(
             format="engine",
-            imgsz=None,  # Use model's native size
+            imgsz=imgsz,
             half=fp16,
             workspace=workspace,
             verbose=verbose

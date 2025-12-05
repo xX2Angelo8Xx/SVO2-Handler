@@ -73,7 +73,8 @@ class DepthPlotCanvas(QLabel):
             self.axes.set_title('Mean Depth (Last 30 Frames)', fontsize=10)
             self.axes.grid(True, alpha=0.3)
             self.axes.tick_params(labelsize=8)
-            self.fig.tight_layout()
+            # Add padding to prevent clipping
+            self.fig.tight_layout(pad=1.5)
             
             self.depth_data = []
             self.max_points = 30
@@ -130,7 +131,7 @@ class DepthPlotCanvas(QLabel):
             max_depth = max(self.depth_data) if self.depth_data else 40
             self.axes.set_ylim(0, min(max_depth * 1.2, 45))
         
-        self.fig.tight_layout()
+        self.fig.tight_layout(pad=1.5)
         self._render_to_pixmap()
     
     def clear_plot(self):
@@ -142,8 +143,194 @@ class DepthPlotCanvas(QLabel):
             self.axes.set_ylabel('Depth (m)', fontsize=9)
             self.axes.set_title('Mean Depth (Last 30 Frames)', fontsize=10)
             self.axes.grid(True, alpha=0.3)
-            self.fig.tight_layout()
+            self.fig.tight_layout(pad=1.5)
             self._render_to_pixmap()
+
+
+class DepthMapViewer(QLabel):
+    """Widget for displaying colorized depth map from target bounding box."""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(320, 240)
+        self.setMaximumSize(640, 480)
+        self.setStyleSheet("background-color: #000; border: 1px solid #555;")
+        self.setText("No depth data")
+        self.setStyleSheet("background-color: #000; color: #666; border: 1px solid #555;")
+        self.is_visible = False
+    
+    def update_depth_map(self, depth_array, bbox_coords):
+        """
+        Update depth map visualization.
+        
+        Args:
+            depth_array: Full depth map (numpy array, shape HxW)
+            bbox_coords: Tuple (x1, y1, x2, y2) in pixel coordinates
+        """
+        if not MATPLOTLIB_AVAILABLE or depth_array is None:
+            return
+        
+        try:
+            import cv2
+            
+            # Extract ROI from depth map
+            x1, y1, x2, y2 = [int(c) for c in bbox_coords]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2 = min(depth_array.shape[1], x2)
+            y2 = min(depth_array.shape[0], y2)
+            
+            roi = depth_array[y1:y2, x1:x2]
+            
+            if roi.size == 0:
+                self.setText("Invalid ROI")
+                return
+            
+            # Create matplotlib figure
+            fig = Figure(figsize=(4, 3), dpi=80)
+            fig.patch.set_facecolor('#000000')
+            ax = fig.add_subplot(111)
+            
+            # Apply colormap (viridis for depth)
+            im = ax.imshow(roi, cmap='viridis', interpolation='nearest')
+            ax.set_title('Depth Map (Target Area)', fontsize=10, color='white')
+            ax.axis('off')
+            
+            # Add colorbar
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label('Depth (m)', fontsize=8, color='white')
+            cbar.ax.tick_params(labelsize=7, colors='white')
+            
+            fig.tight_layout(pad=0.5)
+            
+            # Render to pixmap
+            canvas = FigureCanvasAgg(fig)
+            canvas.draw()
+            buf = canvas.buffer_rgba()
+            width, height = int(fig.get_figwidth() * fig.dpi), int(fig.get_figheight() * fig.dpi)
+            
+            qimage = QImage(buf, width, height, QImage.Format.Format_RGBA8888)
+            pixmap = QPixmap.fromImage(qimage)
+            
+            # Scale to fit label
+            scaled = pixmap.scaled(self.width(), self.height(),
+                                  Qt.AspectRatioMode.KeepAspectRatio,
+                                  Qt.TransformationMode.SmoothTransformation)
+            self.setPixmap(scaled)
+            
+        except Exception as e:
+            self.setText(f"Error: {str(e)[:30]}")
+    
+    def clear(self):
+        """Clear the depth map display."""
+        self.clear()
+        self.setText("No depth data")
+        self.setStyleSheet("background-color: #000; color: #666; border: 1px solid #555;")
+
+
+class DepthTimePlot(QLabel):
+    """Widget for displaying depth over time as a line chart (60-frame rolling window)."""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(400, 200)
+        self.setStyleSheet("background-color: #f5f5f5; border: 1px solid #ccc;")
+        
+        if MATPLOTLIB_AVAILABLE:
+            self.depth_history = deque(maxlen=60)
+            self.frame_history = deque(maxlen=60)
+            self.current_frame = 0
+            self._render_empty_plot()
+        else:
+            self.setText("Matplotlib not available")
+    
+    def _render_empty_plot(self):
+        """Render an empty plot."""
+        if not MATPLOTLIB_AVAILABLE:
+            return
+        
+        fig = Figure(figsize=(5, 2.5), dpi=80)
+        fig.patch.set_facecolor('#f5f5f5')
+        ax = fig.add_subplot(111)
+        ax.set_facecolor('#ffffff')
+        ax.set_xlabel('Frame', fontsize=9)
+        ax.set_ylabel('Depth (m)', fontsize=9)
+        ax.set_title('Target Depth Over Time (Last 60 Frames)', fontsize=10, fontweight='bold')
+        ax.grid(True, alpha=0.3, linestyle='--')
+        ax.set_xlim(0, 60)
+        ax.set_ylim(0, 40)
+        fig.tight_layout(pad=1.0)
+        
+        # Render to pixmap
+        canvas = FigureCanvasAgg(fig)
+        canvas.draw()
+        buf = canvas.buffer_rgba()
+        width, height = int(fig.get_figwidth() * fig.dpi), int(fig.get_figheight() * fig.dpi)
+        
+        qimage = QImage(buf, width, height, QImage.Format.Format_RGBA8888)
+        self.setPixmap(QPixmap.fromImage(qimage))
+    
+    def update_plot(self, depth_value: float, frame_number: int):
+        """
+        Update depth time plot with new value.
+        
+        Args:
+            depth_value: Current mean depth in meters
+            frame_number: Current frame number
+        """
+        if not MATPLOTLIB_AVAILABLE:
+            return
+        
+        # Add to history
+        self.depth_history.append(depth_value if depth_value > 0 else 0)
+        self.frame_history.append(frame_number)
+        
+        if len(self.depth_history) < 2:
+            return  # Need at least 2 points to plot
+        
+        # Create figure
+        fig = Figure(figsize=(5, 2.5), dpi=80)
+        fig.patch.set_facecolor('#f5f5f5')
+        ax = fig.add_subplot(111)
+        ax.set_facecolor('#ffffff')
+        
+        # Plot data
+        x_data = list(range(len(self.depth_history)))
+        ax.plot(x_data, list(self.depth_history), 'b-', linewidth=2, marker='o', markersize=3, alpha=0.8)
+        ax.fill_between(x_data, 0, list(self.depth_history), alpha=0.2, color='blue')
+        
+        # Styling
+        ax.set_xlabel('Frames Ago', fontsize=9)
+        ax.set_ylabel('Depth (m)', fontsize=9)
+        ax.set_title('Target Depth Over Time (Last 60 Frames)', fontsize=10, fontweight='bold')
+        ax.grid(True, alpha=0.3, linestyle='--')
+        ax.tick_params(labelsize=8)
+        
+        # Set limits
+        ax.set_xlim(0, max(60, len(self.depth_history)))
+        if self.depth_history:
+            max_depth = max(self.depth_history)
+            ax.set_ylim(0, min(max_depth * 1.2, 45) if max_depth > 0 else 40)
+        
+        fig.tight_layout(pad=1.0)
+        
+        # Render to pixmap
+        canvas = FigureCanvasAgg(fig)
+        canvas.draw()
+        buf = canvas.buffer_rgba()
+        width, height = int(fig.get_figwidth() * fig.dpi), int(fig.get_figheight() * fig.dpi)
+        
+        qimage = QImage(buf, width, height, QImage.Format.Format_RGBA8888)
+        self.setPixmap(QPixmap.fromImage(qimage))
+    
+    def clear(self):
+        """Clear the depth history and reset plot."""
+        if MATPLOTLIB_AVAILABLE:
+            self.depth_history.clear()
+            self.frame_history.clear()
+            self.current_frame = 0
+            self._render_empty_plot()
 
 
 @dataclass
@@ -1269,6 +1456,42 @@ class JetsonBenchmarkApp(QMainWindow):
         self.depth_plot.setMaximumHeight(250)
         stats_layout.addWidget(self.depth_plot)
         
+        # Advanced depth visualizations (collapsible)
+        advanced_viz_group = QGroupBox("Advanced Depth Visualization")
+        advanced_viz_layout = QVBoxLayout()
+        
+        # Toggle buttons
+        toggle_layout = QHBoxLayout()
+        
+        self.toggle_depthmap_btn = QPushButton("📊 Show Depth Heatmap")
+        self.toggle_depthmap_btn.setCheckable(True)
+        self.toggle_depthmap_btn.setChecked(False)
+        self.toggle_depthmap_btn.setStyleSheet("font-size: 10px; padding: 5px;")
+        self.toggle_depthmap_btn.clicked.connect(self._toggle_depth_heatmap)
+        toggle_layout.addWidget(self.toggle_depthmap_btn)
+        
+        self.toggle_timeplot_btn = QPushButton("📈 Show Time Chart")
+        self.toggle_timeplot_btn.setCheckable(True)
+        self.toggle_timeplot_btn.setChecked(False)
+        self.toggle_timeplot_btn.setStyleSheet("font-size: 10px; padding: 5px;")
+        self.toggle_timeplot_btn.clicked.connect(self._toggle_depth_timeplot)
+        toggle_layout.addWidget(self.toggle_timeplot_btn)
+        
+        advanced_viz_layout.addLayout(toggle_layout)
+        
+        # Depth heatmap viewer (hidden by default)
+        self.depth_map_viewer = DepthMapViewer()
+        self.depth_map_viewer.setVisible(False)
+        advanced_viz_layout.addWidget(self.depth_map_viewer)
+        
+        # Depth time plot (hidden by default)
+        self.depth_time_plot = DepthTimePlot()
+        self.depth_time_plot.setVisible(False)
+        advanced_viz_layout.addWidget(self.depth_time_plot)
+        
+        advanced_viz_group.setLayout(advanced_viz_layout)
+        stats_layout.addWidget(advanced_viz_group)
+        
         stats_group.setLayout(stats_layout)
         right_layout.addWidget(stats_group)
         
@@ -1471,6 +1694,10 @@ class JetsonBenchmarkApp(QMainWindow):
         self.depth_label.setText("Depth: -- m")
         self.depth_plot.clear_plot()
         
+        # Clear advanced visualizations
+        self.depth_map_viewer.clear()
+        self.depth_time_plot.clear()
+        
         # Connect preview if enabled
         if self.save_images_check.isChecked() and self.show_preview_check.isChecked():
             self.svo_worker.frame_processed.connect(self._on_frame_preview)
@@ -1535,6 +1762,32 @@ class JetsonBenchmarkApp(QMainWindow):
             self.pause_btn.setEnabled(False)
             self.stop_btn.setEnabled(False)
     
+    def _toggle_depth_heatmap(self):
+        """Toggle visibility of depth heatmap visualization."""
+        is_checked = self.toggle_depthmap_btn.isChecked()
+        self.depth_map_viewer.setVisible(is_checked)
+        
+        if is_checked:
+            self.toggle_depthmap_btn.setText("📊 Hide Depth Heatmap")
+            self.output_text.append("📊 Depth heatmap visualization enabled")
+        else:
+            self.toggle_depthmap_btn.setText("📊 Show Depth Heatmap")
+            self.output_text.append("📊 Depth heatmap visualization disabled")
+            self.depth_map_viewer.clear()
+    
+    def _toggle_depth_timeplot(self):
+        """Toggle visibility of depth time plot."""
+        is_checked = self.toggle_timeplot_btn.isChecked()
+        self.depth_time_plot.setVisible(is_checked)
+        
+        if is_checked:
+            self.toggle_timeplot_btn.setText("📈 Hide Time Chart")
+            self.output_text.append("📈 Depth time chart visualization enabled")
+        else:
+            self.toggle_timeplot_btn.setText("📈 Show Time Chart")
+            self.output_text.append("📈 Depth time chart visualization disabled")
+            self.depth_time_plot.clear()
+    
     def _on_svo_progress(self, current: int, total: int, status: str, fps: float, num_objects: int, 
                          mean_depth: float, component_percentages: dict, depth_data: object):
         """Handle SVO processing progress with detailed stats."""
@@ -1564,7 +1817,16 @@ class JetsonBenchmarkApp(QMainWindow):
             self.depth_pct_label.setText(f"Depth: {component_percentages.get('depth', 0):.1f} %")
             self.housekeeping_pct_label.setText(f"Housekeeping: {component_percentages.get('housekeeping', 0):.1f} %")
         
-        # TODO: Update depth map visualization if depth_data is provided
+        # Update advanced depth visualizations if enabled and data available
+        if depth_data is not None and hasattr(depth_data, 'depth_array') and hasattr(depth_data, 'bbox'):
+            # Update depth heatmap if visible
+            if self.toggle_depthmap_btn.isChecked() and self.depth_map_viewer.isVisible():
+                self.depth_map_viewer.update_depth_map(depth_data.depth_array, depth_data.bbox)
+            
+            # Update depth time plot if visible
+            if self.toggle_timeplot_btn.isChecked() and self.depth_time_plot.isVisible():
+                if mean_depth > 0:
+                    self.depth_time_plot.update_plot(mean_depth, current)
         
         # Log every 10 frames
         if current % 10 == 0:

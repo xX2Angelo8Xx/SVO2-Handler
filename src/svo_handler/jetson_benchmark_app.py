@@ -15,6 +15,7 @@ Supports multiple benchmark scenarios:
 """
 
 import sys
+import os
 import json
 import shutil
 import time
@@ -23,6 +24,8 @@ from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, asdict
 from typing import List, Optional, Tuple
+from collections import deque
+import numpy as np
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -33,33 +36,36 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, Signal, QSize
 from PySide6.QtGui import QFont, QPixmap, QImage, QPainter, QPen, QColor, QBrush
 
+# Configure matplotlib to use Agg backend (non-interactive, no Qt dependency)
+os.environ['MPLBACKEND'] = 'Agg'
+
 # Matplotlib for depth plot
 MATPLOTLIB_AVAILABLE = False
-FigureCanvasQTAgg = None
 
 try:
     import matplotlib
-    # Try QtAgg backend (works with PySide6/PyQt6)
-    matplotlib.use('QtAgg')
-    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+    matplotlib.use('Agg')  # Force Agg backend before importing pyplot
     from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
     MATPLOTLIB_AVAILABLE = True
 except Exception as e:
-    # If QtAgg fails, matplotlib is not usable with current Qt version
+    # If matplotlib fails, depth plotting will be disabled
     print(f"Warning: matplotlib not available ({type(e).__name__}: {e})")
     print("Depth plot will be disabled. This is non-critical.")
-    # Create dummy base class
-    FigureCanvasQTAgg = QWidget
+    FigureCanvasAgg = None
 
 
-class DepthPlotCanvas(FigureCanvasQTAgg if MATPLOTLIB_AVAILABLE else QWidget):
-    """Canvas for plotting depth over time."""
+class DepthPlotCanvas(QLabel):
+    """Canvas for plotting depth over time using matplotlib Agg backend."""
     
     def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(400, 240)
+        
         if MATPLOTLIB_AVAILABLE:
             self.fig = Figure(figsize=(5, 3), dpi=100)
             self.fig.patch.set_facecolor('#f0f0f0')
-            super().__init__(self.fig)
             self.axes = self.fig.add_subplot(111)
             self.axes.set_facecolor('#ffffff')
             self.axes.set_xlabel('Frame', fontsize=9)
@@ -71,12 +77,32 @@ class DepthPlotCanvas(FigureCanvasQTAgg if MATPLOTLIB_AVAILABLE else QWidget):
             
             self.depth_data = []
             self.max_points = 30
+            
+            # Render initial empty plot
+            self._render_to_pixmap()
         else:
-            super().__init__(parent)
-            layout = QVBoxLayout(self)
-            label = QLabel("Matplotlib not available")
-            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            layout.addWidget(label)
+            self.setText("Matplotlib not available")
+            self.setStyleSheet("background-color: #f0f0f0; color: #666;")
+    
+    def _render_to_pixmap(self):
+        """Render matplotlib figure to QPixmap and display it."""
+        if not MATPLOTLIB_AVAILABLE:
+            return
+        
+        # Create canvas and render figure to buffer
+        canvas = FigureCanvasAgg(self.fig)
+        canvas.draw()
+        
+        # Get RGBA buffer and convert to QImage
+        buf = canvas.buffer_rgba()
+        width, height = self.fig.get_size_inches() * self.fig.dpi
+        width, height = int(width), int(height)
+        
+        qimage = QImage(buf, width, height, QImage.Format.Format_RGBA8888)
+        pixmap = QPixmap.fromImage(qimage)
+        
+        # Display in label
+        self.setPixmap(pixmap)
     
     def update_plot(self, depth_value: float):
         """Update plot with new depth value."""
@@ -105,7 +131,7 @@ class DepthPlotCanvas(FigureCanvasQTAgg if MATPLOTLIB_AVAILABLE else QWidget):
             self.axes.set_ylim(0, min(max_depth * 1.2, 45))
         
         self.fig.tight_layout()
-        self.draw()
+        self._render_to_pixmap()
     
     def clear_plot(self):
         """Clear all data."""
@@ -117,7 +143,7 @@ class DepthPlotCanvas(FigureCanvasQTAgg if MATPLOTLIB_AVAILABLE else QWidget):
             self.axes.set_title('Mean Depth (Last 30 Frames)', fontsize=10)
             self.axes.grid(True, alpha=0.3)
             self.fig.tight_layout()
-            self.draw()
+            self._render_to_pixmap()
 
 
 @dataclass
@@ -284,7 +310,8 @@ class SVOScenarioWorker(QThread):
     loading_complete = Signal()  # SVO loaded and ready
     loading_failed = Signal(str)  # error message
     
-    progress_updated = Signal(int, int, str, float, int, float)  # current, total, status, fps, num_objects, mean_depth
+    # Enhanced progress signal: current, total, status, fps, num_objects, mean_depth, component_percentages, depth_data
+    progress_updated = Signal(int, int, str, float, int, float, dict, object)
     frame_processed = Signal(object)  # preview image (numpy RGB array)
     benchmark_complete = Signal(str, float, dict)  # run_folder, total_time, stats
     benchmark_failed = Signal(str)  # error message
@@ -302,8 +329,17 @@ class SVOScenarioWorker(QThread):
         self.save_images = save_images
         self.save_annotations_only = save_annotations_only
         self._cancelled = False
+        self._paused = False  # Flag for pause/resume functionality
         self._start_benchmark = False  # Flag to start benchmark phase
         self.scenario = None
+        
+        # Rolling window timing for 4-stage pipeline
+        self.timing_windows = {
+            'grab': deque(maxlen=60),
+            'inference': deque(maxlen=60),
+            'depth': deque(maxlen=60),
+            'housekeeping': deque(maxlen=60)
+        }
         
         # Connect internal signal
         self.start_processing.connect(self._set_start_flag)
@@ -391,9 +427,7 @@ class SVOScenarioWorker(QThread):
             total_frames = self.scenario.total_frames
             frames_processed = 0
             detection_counts = []
-            all_timings = {'grab': [], 'inference': [], 'depth': []}
-            if self.save_images:
-                all_timings['save'] = []
+            all_timings = {'grab': [], 'inference': [], 'depth': [], 'housekeeping': []}
             
             # Frame-to-frame timing
             frame_intervals = []
@@ -405,7 +439,15 @@ class SVOScenarioWorker(QThread):
             
             # Process entire SVO file
             while not self._cancelled:
+                # Check if paused
+                while self._paused and not self._cancelled:
+                    self.msleep(100)  # Sleep 100ms while paused
+                
+                if self._cancelled:
+                    break
+                
                 frame_start = time.time()
+                housekeeping_start = None  # Will be set after depth extraction
                 
                 # Run frame processing
                 result = self.scenario.run_frame(None)
@@ -426,10 +468,46 @@ class SVOScenarioWorker(QThread):
                 depths = [d.get('depth_mean', -1) for d in detections if d.get('depth_mean', -1) > 0]
                 mean_depth = sum(depths) / len(depths) if depths else -1.0
                 
-                # Accumulate timings
-                for key, value in result.get('timings', {}).items():
-                    if key in all_timings:
-                        all_timings[key].append(value)
+                # === HOUSEKEEPING STAGE START ===
+                housekeeping_start = time.time()
+                
+                # Extract component timings from result
+                grab_time = result.get('timings', {}).get('grab', 0) * 1000  # Convert to ms
+                inference_time = result.get('timings', {}).get('inference', 0) * 1000
+                depth_time = result.get('timings', {}).get('depth', 0) * 1000
+                
+                # Accumulate timings for statistics
+                all_timings['grab'].append(grab_time)
+                all_timings['inference'].append(inference_time)
+                all_timings['depth'].append(depth_time)
+                
+                # Add to rolling windows
+                self.timing_windows['grab'].append(grab_time)
+                self.timing_windows['inference'].append(inference_time)
+                self.timing_windows['depth'].append(depth_time)
+                
+                # Calculate housekeeping time (everything after depth extraction)
+                housekeeping_time = (time.time() - housekeeping_start) * 1000  # Convert to ms
+                self.timing_windows['housekeeping'].append(housekeeping_time)
+                all_timings['housekeeping'].append(housekeeping_time)
+                
+                # Calculate rolling average percentages
+                component_percentages = {}
+                if len(self.timing_windows['grab']) > 0:
+                    total_avg = (
+                        sum(self.timing_windows['grab']) / len(self.timing_windows['grab']) +
+                        sum(self.timing_windows['inference']) / len(self.timing_windows['inference']) +
+                        sum(self.timing_windows['depth']) / len(self.timing_windows['depth']) +
+                        sum(self.timing_windows['housekeeping']) / len(self.timing_windows['housekeeping'])
+                    )
+                    
+                    if total_avg > 0:
+                        component_percentages = {
+                            'grab': (sum(self.timing_windows['grab']) / len(self.timing_windows['grab']) / total_avg) * 100,
+                            'inference': (sum(self.timing_windows['inference']) / len(self.timing_windows['inference']) / total_avg) * 100,
+                            'depth': (sum(self.timing_windows['depth']) / len(self.timing_windows['depth']) / total_avg) * 100,
+                            'housekeeping': (sum(self.timing_windows['housekeeping']) / len(self.timing_windows['housekeeping']) / total_avg) * 100
+                        }
                 
                 # Calculate FPS and frame timing
                 frame_time = time.time() - frame_start
@@ -447,9 +525,11 @@ class SVOScenarioWorker(QThread):
                 else:
                     frames_empty_times.append(frame_time * 1000)
                 
-                # Update progress with detection info
+                # Update progress with detection info and component percentages
                 status = f"Frame {frames_processed}/{total_frames}"
-                self.progress_updated.emit(frames_processed, total_frames, status, fps, len(detections), mean_depth)
+                depth_data = None  # TODO: Pass depth array and bbox for visualization
+                self.progress_updated.emit(frames_processed, total_frames, status, fps, len(detections), 
+                                          mean_depth, component_percentages, depth_data)
             
             if self._cancelled:
                 self.scenario.cleanup()
@@ -1072,6 +1152,25 @@ class JetsonBenchmarkApp(QMainWindow):
         self.svo_start_btn.setEnabled(False)
         left_layout.addWidget(self.svo_start_btn)
         
+        # Pause/Stop control buttons
+        control_layout = QHBoxLayout()
+        
+        self.pause_btn = QPushButton("⏸ Pause")
+        self.pause_btn.setStyleSheet("background-color: #FF9800; color: white; font-size: 11px; padding: 8px;")
+        self.pause_btn.clicked.connect(self._toggle_pause)
+        self.pause_btn.setVisible(False)
+        self.pause_btn.setEnabled(False)
+        control_layout.addWidget(self.pause_btn)
+        
+        self.stop_btn = QPushButton("⏹ Stop")
+        self.stop_btn.setStyleSheet("background-color: #F44336; color: white; font-size: 11px; padding: 8px;")
+        self.stop_btn.clicked.connect(self._stop_benchmark)
+        self.stop_btn.setVisible(False)
+        self.stop_btn.setEnabled(False)
+        control_layout.addWidget(self.stop_btn)
+        
+        left_layout.addLayout(control_layout)
+        
         self.load_prev_btn = QPushButton("📂 Load Previous Run")
         self.load_prev_btn.setStyleSheet("background-color: #757575; color: white; font-size: 11px; padding: 8px;")
         self.load_prev_btn.clicked.connect(self._load_previous_run)
@@ -1139,6 +1238,30 @@ class JetsonBenchmarkApp(QMainWindow):
         metrics_layout.addLayout(col2_layout)
         
         stats_layout.addLayout(metrics_layout)
+        
+        # Component timing breakdown (4-stage pipeline)
+        component_group = QGroupBox("Component Breakdown (60-frame avg)")
+        component_layout = QVBoxLayout()
+        component_layout.setSpacing(2)
+        
+        self.grab_pct_label = QLabel("Grab: -- %")
+        self.grab_pct_label.setStyleSheet("font-size: 10px; color: #0066cc;")
+        component_layout.addWidget(self.grab_pct_label)
+        
+        self.inference_pct_label = QLabel("YOLO: -- %")
+        self.inference_pct_label.setStyleSheet("font-size: 10px; color: #009900;")
+        component_layout.addWidget(self.inference_pct_label)
+        
+        self.depth_pct_label = QLabel("Depth: -- %")
+        self.depth_pct_label.setStyleSheet("font-size: 10px; color: #ff6600;")
+        component_layout.addWidget(self.depth_pct_label)
+        
+        self.housekeeping_pct_label = QLabel("Housekeeping: -- %")
+        self.housekeeping_pct_label.setStyleSheet("font-size: 10px; color: #cc0066;")
+        component_layout.addWidget(self.housekeeping_pct_label)
+        
+        component_group.setLayout(component_layout)
+        stats_layout.addWidget(component_group)
         
         # Depth plot
         self.depth_plot = DepthPlotCanvas()
@@ -1356,6 +1479,12 @@ class JetsonBenchmarkApp(QMainWindow):
         self.svo_start_btn.setEnabled(False)
         self.svo_load_btn.setEnabled(False)
         
+        # Enable pause/stop buttons
+        self.pause_btn.setVisible(True)
+        self.pause_btn.setEnabled(True)
+        self.stop_btn.setVisible(True)
+        self.stop_btn.setEnabled(True)
+        
         # Connect remaining signals
         self.svo_worker.progress_updated.connect(self._on_svo_progress)
         self.svo_worker.benchmark_complete.connect(self._on_svo_benchmark_complete)
@@ -1364,7 +1493,50 @@ class JetsonBenchmarkApp(QMainWindow):
         # Emit signal to start benchmark phase in worker thread
         self.svo_worker.start_processing.emit()
     
-    def _on_svo_progress(self, current: int, total: int, status: str, fps: float, num_objects: int, mean_depth: float):
+    def _toggle_pause(self):
+        """Toggle pause/resume state for benchmark."""
+        if not self.svo_worker:
+            return
+        
+        self.svo_worker._paused = not self.svo_worker._paused
+        
+        if self.svo_worker._paused:
+            self.pause_btn.setText("▶ Resume")
+            self.pause_btn.setStyleSheet("background-color: #4CAF50; color: white; font-size: 11px; padding: 8px;")
+            self.output_text.append("⏸ Benchmark paused")
+            self.statusBar().showMessage("Benchmark paused")
+        else:
+            self.pause_btn.setText("⏸ Pause")
+            self.pause_btn.setStyleSheet("background-color: #FF9800; color: white; font-size: 11px; padding: 8px;")
+            self.output_text.append("▶ Benchmark resumed")
+            self.statusBar().showMessage("Benchmark resumed")
+    
+    def _stop_benchmark(self):
+        """Gracefully stop the running benchmark."""
+        if not self.svo_worker:
+            return
+        
+        reply = QMessageBox.question(
+            self,
+            "Stop Benchmark",
+            "Are you sure you want to stop the benchmark? Partial results will be saved.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            self.output_text.append("⏹ Stopping benchmark...")
+            self.statusBar().showMessage("Stopping benchmark...")
+            
+            # Request cancellation
+            self.svo_worker.cancel()
+            
+            # Disable control buttons
+            self.pause_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
+    
+    def _on_svo_progress(self, current: int, total: int, status: str, fps: float, num_objects: int, 
+                         mean_depth: float, component_percentages: dict, depth_data: object):
         """Handle SVO processing progress with detailed stats."""
         # Update status bar
         self.statusBar().showMessage(f"{status} | FPS: {fps:.1f} | Objects: {num_objects}")
@@ -1384,6 +1556,15 @@ class JetsonBenchmarkApp(QMainWindow):
             self.depth_plot.update_plot(mean_depth)
         else:
             self.depth_label.setText("Depth: No data")
+        
+        # Update component percentages (4-stage breakdown)
+        if component_percentages:
+            self.grab_pct_label.setText(f"Grab: {component_percentages.get('grab', 0):.1f} %")
+            self.inference_pct_label.setText(f"YOLO: {component_percentages.get('inference', 0):.1f} %")
+            self.depth_pct_label.setText(f"Depth: {component_percentages.get('depth', 0):.1f} %")
+            self.housekeeping_pct_label.setText(f"Housekeeping: {component_percentages.get('housekeeping', 0):.1f} %")
+        
+        # TODO: Update depth map visualization if depth_data is provided
         
         # Log every 10 frames
         if current % 10 == 0:
@@ -1410,6 +1591,12 @@ class JetsonBenchmarkApp(QMainWindow):
         """Handle SVO benchmark completion."""
         self.svo_start_btn.setEnabled(False)
         self.svo_load_btn.setEnabled(True)
+        
+        # Hide and disable control buttons
+        self.pause_btn.setVisible(False)
+        self.pause_btn.setEnabled(False)
+        self.stop_btn.setVisible(False)
+        self.stop_btn.setEnabled(False)
         
         self.output_text.append(f"\n✅ Benchmark complete in {total_time:.1f}s")
         self.output_text.append("\n" + "-" * 70)
@@ -1502,6 +1689,13 @@ class JetsonBenchmarkApp(QMainWindow):
         """Handle SVO benchmark failure."""
         self.svo_start_btn.setEnabled(True)
         self.svo_load_btn.setEnabled(True)
+        
+        # Hide and disable control buttons
+        self.pause_btn.setVisible(False)
+        self.pause_btn.setEnabled(False)
+        self.stop_btn.setVisible(False)
+        self.stop_btn.setEnabled(False)
+        
         self.output_text.append(f"\n❌ Benchmark failed: {error_msg}")
         self.statusBar().showMessage("Benchmark failed")
         QMessageBox.critical(self, "Benchmark Failed", error_msg)

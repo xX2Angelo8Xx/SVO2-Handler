@@ -291,7 +291,7 @@ class SVOPipelineScenario(BenchmarkScenario):
                 return False
             
             # Create output directory if needed
-            if self.save_images and self.output_dir:
+            if (self.save_images or self.save_annotations_only) and self.output_dir:
                 Path(self.output_dir).mkdir(parents=True, exist_ok=True)
             
             # Report loading start

@@ -251,6 +251,9 @@ class SVOPipelineScenario(BenchmarkScenario):
         self.loading_complete = False
         self.preview_callback = None
         self.loading_progress_callback = None
+        self.depth_hz = None  # Depth refresh rate (None = every frame)
+        self.depth_frame_count = 0  # Track frames with depth computation
+        self.last_valid_detections = []  # Cache last detections for frame skipping
     
     def setup(self, config: Dict[str, Any]) -> bool:
         """
@@ -267,6 +270,8 @@ class SVOPipelineScenario(BenchmarkScenario):
                 - save_images: Whether to save annotated frames
                 - save_annotations_only: Save only YOLO .txt files (fast)
                 - output_dir: Directory for saved images (if save_images=True)
+                - depth_mode: Depth mode string (NEURAL_LIGHT, NEURAL, NEURAL_PLUS)
+                - depth_hz: Depth refresh rate in Hz (None=every frame, 1-10 for frame skipping)
                 - loading_progress_callback: Function to call with loading progress
                 - preview_callback: Function to call with preview image
         
@@ -287,6 +292,18 @@ class SVOPipelineScenario(BenchmarkScenario):
             self.preview_callback = config.get('preview_callback')
             self.loading_progress_callback = config.get('loading_progress_callback')
             
+            # Get depth mode from config
+            depth_mode_str = config.get('depth_mode', 'NEURAL_PLUS')
+            depth_mode_map = {
+                'NEURAL_LIGHT': sl.DEPTH_MODE.NEURAL,  # NEURAL_LIGHT maps to NEURAL in SDK
+                'NEURAL': sl.DEPTH_MODE.NEURAL,
+                'NEURAL_PLUS': sl.DEPTH_MODE.NEURAL_PLUS
+            }
+            depth_mode = depth_mode_map.get(depth_mode_str, sl.DEPTH_MODE.NEURAL_PLUS)
+            
+            # Get depth Hz (for frame skipping)
+            self.depth_hz = config.get('depth_hz', None)  # None = every frame
+            
             if not svo_path or not model_path:
                 return False
             
@@ -303,7 +320,7 @@ class SVOPipelineScenario(BenchmarkScenario):
             
             init_params = sl.InitParameters()
             init_params.set_from_svo_file(str(svo_path))
-            init_params.depth_mode = sl.DEPTH_MODE.NEURAL_PLUS  # Best quality
+            init_params.depth_mode = depth_mode  # Use selected depth mode
             init_params.coordinate_units = sl.UNIT.METER
             init_params.depth_minimum_distance = 1.0  # 1 meter minimum
             init_params.depth_maximum_distance = 40.0  # 40 meters maximum
@@ -319,18 +336,27 @@ class SVOPipelineScenario(BenchmarkScenario):
             # Get total frame count
             self.total_frames = self.camera.get_svo_number_of_frames()
             
-            if self.loading_progress_callback:
-                self.loading_progress_callback(30, f"Loading NEURAL_PLUS depth (this takes 30-60s)...")
+            # Dynamic loading message based on depth mode
+            if depth_mode_str in ['NEURAL', 'NEURAL_PLUS']:
+                if self.loading_progress_callback:
+                    self.loading_progress_callback(30, f"Loading {depth_mode_str} depth (this takes 30-60s)...")
+            else:
+                if self.loading_progress_callback:
+                    self.loading_progress_callback(30, f"Initializing {depth_mode_str} depth mode...")
             
             # Do a test grab to trigger depth initialization
-            # NEURAL_PLUS depth mode requires preprocessing that happens on first grab
+            # NEURAL/NEURAL_PLUS depth modes require preprocessing that happens on first grab
             test_params = sl.RuntimeParameters()
             test_params.confidence_threshold = 50
             
-            for i in range(3):  # Multiple grabs ensure full initialization
+            num_test_grabs = 3 if depth_mode_str in ['NEURAL', 'NEURAL_PLUS'] else 1
+            for i in range(num_test_grabs):  # Multiple grabs ensure full initialization for neural modes
                 if self.camera.grab(test_params) == sl.ERROR_CODE.SUCCESS:
                     if self.loading_progress_callback:
-                        self.loading_progress_callback(30 + (i+1) * 15, "Initializing depth neural network...")
+                        if depth_mode_str in ['NEURAL', 'NEURAL_PLUS']:
+                            self.loading_progress_callback(30 + (i+1) * 15, "Initializing depth neural network...")
+                        else:
+                            self.loading_progress_callback(30 + (i+1) * 15, "Testing depth computation...")
                     time.sleep(0.1)
             
             # Reset to start of SVO
@@ -411,33 +437,58 @@ class SVOPipelineScenario(BenchmarkScenario):
         results = self.model(img_bgr, conf=self.conf_threshold, verbose=False)
         timings['inference'] = (time.time() - inference_start) * 1000
         
-        # 3. Extract depth ONLY in bbox areas
+        # 3. Extract depth ONLY in bbox areas (with frame skipping support)
         depth_start = time.time()
         detections = []
         
-        # Retrieve depth once for all boxes
-        self.camera.retrieve_measure(self.depth, sl.MEASURE.DEPTH)
-        depth_np = self.depth.get_data()
+        # Determine if we should compute depth this frame
+        compute_depth = False
+        if self.depth_hz is None:
+            # Every frame
+            compute_depth = True
+        else:
+            # Frame skipping: compute depth every N-th frame
+            # Assumes SVO2 file has consistent FPS
+            svo_fps = 60  # Default assumption for ZED2i
+            frame_interval = max(1, int(svo_fps / self.depth_hz))
+            compute_depth = (self.frame_index % frame_interval == 0)
+        
+        if compute_depth:
+            # Retrieve depth once for all boxes
+            self.camera.retrieve_measure(self.depth, sl.MEASURE.DEPTH)
+            depth_np = self.depth.get_data()
+            self.depth_frame_count += 1
+        else:
+            # Skip depth computation, use cached detections from last frame
+            depth_np = None
         
         for box in results[0].boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
             
-            # Extract bbox region from depth
-            depth_roi = depth_np[y1:y2, x1:x2]
-            
-            # Calculate stats (ignoring invalid depth)
-            # Valid depth range: 1.0m to 40.0m
-            valid_depth = depth_roi[
-                ~np.isnan(depth_roi) & 
-                ~np.isinf(depth_roi) & 
-                (depth_roi > 0) &
-                (depth_roi >= 1.0) &  # 1 meter minimum
-                (depth_roi <= 40.0)   # 40 meters maximum
-            ]
-            
-            # Calculate mean depth (average all valid pixels in bbox)
-            mean_depth = float(np.mean(valid_depth)) if len(valid_depth) > 0 else -1.0
-            std_depth = float(np.std(valid_depth)) if len(valid_depth) > 0 else 0.0
+            if depth_np is not None:
+                # Compute depth for this detection
+                # Extract bbox region from depth
+                depth_roi = depth_np[y1:y2, x1:x2]
+                
+                # Calculate stats (ignoring invalid depth)
+                # Valid depth range: 1.0m to 40.0m
+                valid_depth = depth_roi[
+                    ~np.isnan(depth_roi) & 
+                    ~np.isinf(depth_roi) & 
+                    (depth_roi > 0) &
+                    (depth_roi >= 1.0) &  # 1 meter minimum
+                    (depth_roi <= 40.0)   # 40 meters maximum
+                ]
+                
+                # Calculate mean depth (average all valid pixels in bbox)
+                mean_depth = float(np.mean(valid_depth)) if len(valid_depth) > 0 else -1.0
+                std_depth = float(np.std(valid_depth)) if len(valid_depth) > 0 else 0.0
+                valid_pixels = len(valid_depth)
+            else:
+                # No depth computation this frame - use placeholder values
+                mean_depth = -1.0
+                std_depth = 0.0
+                valid_pixels = 0
             
             detections.append({
                 'class': int(box.cls[0]),
@@ -445,8 +496,12 @@ class SVOPipelineScenario(BenchmarkScenario):
                 'bbox': [x1, y1, x2, y2],
                 'depth_mean': mean_depth,
                 'depth_std': std_depth,
-                'depth_valid_pixels': len(valid_depth)
+                'depth_valid_pixels': valid_pixels
             })
+        
+        # Cache detections if we computed depth
+        if depth_np is not None:
+            self.last_valid_detections = detections
         
         timings['depth'] = (time.time() - depth_start) * 1000
         

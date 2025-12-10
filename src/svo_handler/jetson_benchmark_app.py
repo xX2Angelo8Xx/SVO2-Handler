@@ -511,10 +511,13 @@ class SVOScenarioWorker(QThread):
     benchmark_failed = Signal(str)  # error message
     
     start_processing = Signal()  # Internal signal to start processing phase
+    skip_frames_requested = Signal(int)  # Request to skip N frames
+    frames_skipped = Signal(int, int)  # Frames skipped, new position
     
     def __init__(self, engine_path: Path, svo_path: Path, output_folder: Path,
                  conf_threshold: float = 0.25, save_images: bool = False,
-                 save_annotations_only: bool = False):
+                 save_annotations_only: bool = False, depth_mode: str = "NEURAL_PLUS",
+                 depth_hz: Optional[int] = None):
         super().__init__()
         self.engine_path = engine_path
         self.svo_path = svo_path
@@ -522,9 +525,12 @@ class SVOScenarioWorker(QThread):
         self.conf_threshold = conf_threshold
         self.save_images = save_images
         self.save_annotations_only = save_annotations_only
+        self.depth_mode = depth_mode
+        self.depth_hz = depth_hz
         self._cancelled = False
         self._paused = False  # Flag for pause/resume functionality
         self._start_benchmark = False  # Flag to start benchmark phase
+        self._skip_frames = 0  # Number of frames to skip (set by signal)
         self.scenario = None
         
         # Rolling window timing for 4-stage pipeline
@@ -535,8 +541,9 @@ class SVOScenarioWorker(QThread):
             'housekeeping': deque(maxlen=60)
         }
         
-        # Connect internal signal (use QueuedConnection for cross-thread communication)
+        # Connect internal signals (use QueuedConnection for cross-thread communication)
         self.start_processing.connect(self._set_start_flag, Qt.ConnectionType.QueuedConnection)
+        self.skip_frames_requested.connect(self._set_skip_frames, Qt.ConnectionType.QueuedConnection)
     
     def cancel(self):
         """Request cancellation of the worker."""
@@ -546,6 +553,10 @@ class SVOScenarioWorker(QThread):
         """Set flag to start benchmark processing."""
         print("[DEBUG] _set_start_flag called - setting _start_benchmark to True")
         self._start_benchmark = True
+    
+    def _set_skip_frames(self, count: int):
+        """Set number of frames to skip (called from signal)."""
+        self._skip_frames = count
     
     def run(self):
         """Run SVO2 pipeline benchmark."""
@@ -578,6 +589,8 @@ class SVOScenarioWorker(QThread):
                 'save_images': self.save_images,
                 'save_annotations_only': self.save_annotations_only,
                 'output_dir': output_dir,
+                'depth_mode': self.depth_mode,
+                'depth_hz': self.depth_hz,
                 'loading_progress_callback': loading_callback,
                 'preview_callback': preview_callback  # Always provide callback, worker decides if to use it
             }
@@ -644,6 +657,25 @@ class SVOScenarioWorker(QThread):
                 # Check if paused
                 while self._paused and not self._cancelled:
                     self.msleep(100)  # Sleep 100ms while paused
+                    
+                    # Check if frame skip was requested
+                    if self._skip_frames > 0:
+                        skip_count = self._skip_frames
+                        self._skip_frames = 0  # Reset
+                        
+                        # Get current position
+                        current_pos = self.scenario.frame_index
+                        target_pos = min(current_pos + skip_count, self.scenario.total_frames - 1)
+                        
+                        # Use ZED SDK's set_svo_position for efficient skipping
+                        try:
+                            self.scenario.camera.set_svo_position(target_pos)
+                            # Note: frame_index will be incremented by run_frame() after grab
+                            # So we set it to target_pos - 1 so after increment it becomes target_pos
+                            self.scenario.frame_index = target_pos - 1
+                            self.frames_skipped.emit(skip_count, target_pos)
+                        except Exception as e:
+                            print(f"Error skipping frames: {e}")
                 
                 if self._cancelled:
                     break
@@ -663,6 +695,10 @@ class SVOScenarioWorker(QThread):
                     continue
                 
                 frames_processed += 1
+                
+                # Get actual frame index from scenario (important for skip functionality)
+                actual_frame_index = result.get('frame_index', frames_processed)
+                
                 detections = result.get('detections', [])
                 detection_counts.append(len(detections))
                 
@@ -744,8 +780,9 @@ class SVOScenarioWorker(QThread):
                             )
                 
                 # Update progress with detection info and component percentages
-                status = f"Frame {frames_processed}/{total_frames}"
-                self.progress_updated.emit(frames_processed, total_frames, status, fps, len(detections), 
+                # Use actual_frame_index to show correct position after skips
+                status = f"Frame {actual_frame_index}/{total_frames}"
+                self.progress_updated.emit(actual_frame_index, total_frames, status, fps, len(detections), 
                                           mean_depth, component_percentages, depth_data)
             
             if self._cancelled:
@@ -1330,6 +1367,47 @@ class JetsonBenchmarkApp(QMainWindow):
         self.svo_options_group = QGroupBox("4. Options")
         svo_options_layout = QVBoxLayout()
         
+        # Depth mode selection
+        depth_mode_layout = QHBoxLayout()
+        depth_mode_layout.addWidget(QLabel("Depth Mode:"))
+        self.depth_mode_combo = QComboBox()
+        self.depth_mode_combo.addItems([
+            "NEURAL_LIGHT (Fastest, 0.3-5m)",
+            "NEURAL (Balanced, 0.3-9m)",
+            "NEURAL_PLUS (Best Quality, 0.3-12m)"
+        ])
+        self.depth_mode_combo.setCurrentIndex(2)  # Default to NEURAL_PLUS
+        self.depth_mode_combo.setToolTip(
+            "NEURAL_LIGHT: Fastest, best for multi-camera setups\n"
+            "NEURAL: Balanced depth and performance\n"
+            "NEURAL_PLUS: Highest detail, most robust to environmental changes"
+        )
+        depth_mode_layout.addWidget(self.depth_mode_combo, 1)
+        svo_options_layout.addLayout(depth_mode_layout)
+        
+        # Depth refresh Hz selection
+        depth_hz_layout = QHBoxLayout()
+        depth_hz_layout.addWidget(QLabel("Depth Refresh:"))
+        self.depth_hz_combo = QComboBox()
+        self.depth_hz_combo.addItems([
+            "Every frame",
+            "10 Hz",
+            "5 Hz",
+            "4 Hz",
+            "3 Hz",
+            "2 Hz",
+            "1 Hz"
+        ])
+        self.depth_hz_combo.setCurrentIndex(0)  # Default to every frame
+        self.depth_hz_combo.setToolTip(
+            "Control how often depth is computed:\n"
+            "Every frame: Best accuracy, lowest FPS\n"
+            "10 Hz: Good for tracking, saves processing\n"
+            "1-5 Hz: Light depth monitoring"
+        )
+        depth_hz_layout.addWidget(self.depth_hz_combo, 1)
+        svo_options_layout.addLayout(depth_hz_layout)
+        
         self.save_images_check = QCheckBox("Save annotated frames")
         self.save_images_check.setChecked(False)
         self.save_images_check.toggled.connect(self._on_save_images_toggled)
@@ -1387,6 +1465,27 @@ class JetsonBenchmarkApp(QMainWindow):
         control_layout.addWidget(self.stop_btn)
         
         left_layout.addLayout(control_layout)
+        
+        # Frame skip controls (shown when paused)
+        skip_layout = QHBoxLayout()
+        skip_layout.addWidget(QLabel("Skip frames:"))
+        self.skip_frames_spin = QSpinBox()
+        self.skip_frames_spin.setRange(1, 1000)
+        self.skip_frames_spin.setValue(10)
+        self.skip_frames_spin.setSuffix(" frames")
+        self.skip_frames_spin.setToolTip("Number of frames to skip forward when paused")
+        skip_layout.addWidget(self.skip_frames_spin)
+        
+        self.skip_btn = QPushButton("⏭ Skip")
+        self.skip_btn.setStyleSheet("background-color: #9C27B0; color: white; font-size: 11px; padding: 8px;")
+        self.skip_btn.clicked.connect(self._skip_frames)
+        self.skip_btn.setToolTip("Skip N frames forward (only available when paused)")
+        skip_layout.addWidget(self.skip_btn)
+        
+        self.skip_widget = QWidget()
+        self.skip_widget.setLayout(skip_layout)
+        self.skip_widget.setVisible(False)
+        left_layout.addWidget(self.skip_widget)
         
         self.load_prev_btn = QPushButton("📂 Load Previous Run")
         self.load_prev_btn.setStyleSheet("background-color: #757575; color: white; font-size: 11px; padding: 8px;")
@@ -1544,6 +1643,22 @@ class JetsonBenchmarkApp(QMainWindow):
         self.svo_worker = None
         self.svo_loaded = False
     
+    def _lock_svo_options(self):
+        """Lock SVO2 options during initialization/processing."""
+        self.depth_mode_combo.setEnabled(False)
+        self.depth_hz_combo.setEnabled(False)
+        self.save_images_check.setEnabled(False)
+        self.save_annotations_only_check.setEnabled(False)
+        self.show_preview_check.setEnabled(False)
+    
+    def _unlock_svo_options(self):
+        """Unlock SVO2 options after stopping."""
+        self.depth_mode_combo.setEnabled(True)
+        self.depth_hz_combo.setEnabled(True)
+        self.save_images_check.setEnabled(True)
+        self.save_annotations_only_check.setEnabled(True)
+        self.show_preview_check.setEnabled(True)
+    
     def _on_scenario_changed(self, index: int):
         """Handle scenario selection change."""
         is_svo = (index == 1)  # 0 = Pure Inference, 1 = SVO2 Pipeline
@@ -1573,6 +1688,10 @@ class JetsonBenchmarkApp(QMainWindow):
         # Reset SVO state
         self.svo_loaded = False
         self.svo_start_btn.setEnabled(False)
+        
+        # Make sure options are unlocked when switching scenarios
+        if is_svo:
+            self._unlock_svo_options()
     
     def _browse_input(self):
         """Browse for input (folder or SVO file depending on scenario)."""
@@ -1634,13 +1753,40 @@ class JetsonBenchmarkApp(QMainWindow):
         
         self.run_folder = run_folder
         
+        # Get depth mode from dropdown
+        depth_mode_map = {
+            0: "NEURAL_LIGHT",
+            1: "NEURAL", 
+            2: "NEURAL_PLUS"
+        }
+        depth_mode = depth_mode_map.get(self.depth_mode_combo.currentIndex(), "NEURAL_PLUS")
+        
+        # Get depth Hz from dropdown
+        depth_hz_map = {
+            0: None,  # Every frame
+            1: 10,
+            2: 5,
+            3: 4,
+            4: 3,
+            5: 2,
+            6: 1
+        }
+        depth_hz = depth_hz_map.get(self.depth_hz_combo.currentIndex(), None)
+        
         self.output_text.append("\n" + "=" * 70)
         self.output_text.append("🎬 SVO2 PIPELINE BENCHMARK")
         self.output_text.append("=" * 70)
         self.output_text.append(f"📹 SVO2 File: {svo_path.name}")
         self.output_text.append(f"🤖 Engine: {engine_path.name}")
         self.output_text.append(f"📁 Output: {run_folder}")
-        self.output_text.append("\n⏳ Loading SVO2 file with NEURAL_PLUS depth...")
+        self.output_text.append(f"🧠 Depth Mode: {depth_mode}")
+        
+        if depth_hz is None:
+            self.output_text.append(f"⚡ Depth Refresh: Every frame (highest accuracy)")
+        else:
+            self.output_text.append(f"⚡ Depth Refresh: {depth_hz} Hz (frame skipping enabled)")
+        
+        self.output_text.append("\n⏳ Loading SVO2 file with AI depth...")
         self.output_text.append("   This can take 30-60 seconds for initialization...")
         
         # Clean up old worker if exists
@@ -1656,6 +1802,7 @@ class JetsonBenchmarkApp(QMainWindow):
         # Disable UI during loading
         self.svo_load_btn.setEnabled(False)
         self.svo_start_btn.setEnabled(False)
+        self._lock_svo_options()  # Lock options during initialization
         
         # Show progress dialog
         self.loading_dialog = QProgressDialog("Initializing SVO2 file...", "Cancel", 0, 100, self)
@@ -1669,10 +1816,12 @@ class JetsonBenchmarkApp(QMainWindow):
         save_annotations_only = self.save_annotations_only_check.isChecked()
         self.svo_worker = SVOScenarioWorker(engine_path, svo_path, run_folder, 
                                             conf_threshold=0.25, save_images=save_images,
-                                            save_annotations_only=save_annotations_only)
+                                            save_annotations_only=save_annotations_only,
+                                            depth_mode=depth_mode, depth_hz=depth_hz)
         self.svo_worker.loading_progress.connect(self._on_svo_loading_progress)
         self.svo_worker.loading_complete.connect(self._on_svo_loading_complete)
         self.svo_worker.loading_failed.connect(self._on_svo_loading_failed)
+        self.svo_worker.frames_skipped.connect(self._on_frames_skipped)
         self.svo_worker.start()
     
     def _on_svo_loading_progress(self, progress: int, message: str):
@@ -1703,8 +1852,14 @@ class JetsonBenchmarkApp(QMainWindow):
         """Handle SVO loading failure."""
         self.loading_dialog.close()
         self.svo_load_btn.setEnabled(True)
+        self._unlock_svo_options()  # Unlock options on failure
         self.output_text.append(f"\n❌ Loading failed: {error_msg}")
         QMessageBox.critical(self, "Loading Failed", f"Failed to load SVO2 file:\n\n{error_msg}")
+    
+    def _on_frames_skipped(self, skipped_count: int, new_position: int):
+        """Handle frames skipped notification."""
+        self.output_text.append(f"✅ Skipped {skipped_count} frames → Now at frame {new_position}")
+        self.statusBar().showMessage(f"Skipped to frame {new_position}")
     
     def _start_svo_processing(self):
         """Start SVO2 processing after loading complete."""
@@ -1759,13 +1914,33 @@ class JetsonBenchmarkApp(QMainWindow):
         if self.svo_worker._paused:
             self.pause_btn.setText("▶ Resume")
             self.pause_btn.setStyleSheet("background-color: #4CAF50; color: white; font-size: 11px; padding: 8px;")
-            self.output_text.append("⏸ Benchmark paused")
-            self.statusBar().showMessage("Benchmark paused")
+            self.skip_widget.setVisible(True)  # Show skip controls when paused
+            self.output_text.append("⏸ Benchmark paused - You can now skip frames")
+            self.statusBar().showMessage("Benchmark paused - Use skip controls")
         else:
             self.pause_btn.setText("⏸ Pause")
             self.pause_btn.setStyleSheet("background-color: #FF9800; color: white; font-size: 11px; padding: 8px;")
+            self.skip_widget.setVisible(False)  # Hide skip controls when resumed
             self.output_text.append("▶ Benchmark resumed")
             self.statusBar().showMessage("Benchmark resumed")
+    
+    def _skip_frames(self):
+        """Skip N frames forward when paused."""
+        if not self.svo_worker or not self.svo_worker._paused:
+            QMessageBox.warning(self, "Not Paused", "Please pause the benchmark first before skipping frames.")
+            return
+        
+        if not self.svo_worker.scenario or not self.svo_worker.scenario.camera:
+            QMessageBox.warning(self, "Error", "Camera not available for frame skipping.")
+            return
+        
+        skip_count = self.skip_frames_spin.value()
+        
+        # Signal the worker to skip frames
+        self.svo_worker.skip_frames_requested.emit(skip_count)
+        
+        self.output_text.append(f"⏭ Skipping {skip_count} frames...")
+        self.statusBar().showMessage(f"Skipping {skip_count} frames...")
     
     def _stop_benchmark(self):
         """Gracefully stop the running benchmark."""
@@ -1790,6 +1965,7 @@ class JetsonBenchmarkApp(QMainWindow):
             # Re-enable load and start buttons for next run
             self.svo_load_btn.setEnabled(True)
             self.svo_start_btn.setEnabled(True)
+            self._unlock_svo_options()  # Unlock options after stopping
             
             # Hide control buttons
             self.pause_btn.setVisible(False)

@@ -223,7 +223,6 @@ class DepthMapViewer(QLabel):
     
     def clear(self):
         """Clear the depth map display."""
-        self.clear()
         self.setText("No depth data")
         self.setStyleSheet("background-color: #000; color: #666; border: 1px solid #555;")
 
@@ -348,6 +347,14 @@ class ImageResult:
     image_path: str
     detections: List[DetectionResult]
     inference_time_ms: float
+
+
+@dataclass
+class DepthVisualizationData:
+    """Data for depth visualizations (heatmap and time plot)."""
+    depth_array: any  # numpy array with full depth map
+    bbox: Tuple[int, int, int, int]  # (x1, y1, x2, y2) in pixels
+    mean_depth: float  # mean depth in meters
 
 
 class InferenceWorker(QThread):
@@ -528,8 +535,8 @@ class SVOScenarioWorker(QThread):
             'housekeeping': deque(maxlen=60)
         }
         
-        # Connect internal signal
-        self.start_processing.connect(self._set_start_flag)
+        # Connect internal signal (use QueuedConnection for cross-thread communication)
+        self.start_processing.connect(self._set_start_flag, Qt.ConnectionType.QueuedConnection)
     
     def cancel(self):
         """Request cancellation of the worker."""
@@ -537,6 +544,7 @@ class SVOScenarioWorker(QThread):
     
     def _set_start_flag(self):
         """Set flag to start benchmark processing."""
+        print("[DEBUG] _set_start_flag called - setting _start_benchmark to True")
         self._start_benchmark = True
     
     def run(self):
@@ -571,7 +579,7 @@ class SVOScenarioWorker(QThread):
                 'save_annotations_only': self.save_annotations_only,
                 'output_dir': output_dir,
                 'loading_progress_callback': loading_callback,
-                'preview_callback': preview_callback if self.save_images else None
+                'preview_callback': preview_callback  # Always provide callback, worker decides if to use it
             }
             
             if not self.scenario.setup(config):
@@ -586,8 +594,15 @@ class SVOScenarioWorker(QThread):
             self.loading_complete.emit()
             
             # Phase 2: Wait for start signal
+            print("[DEBUG] Worker: Waiting for start signal (_start_benchmark flag)...")
+            wait_count = 0
             while not self._start_benchmark and not self._cancelled:
                 self.msleep(100)  # Wait 100ms
+                wait_count += 1
+                if wait_count % 10 == 0:  # Print every second
+                    print(f"[DEBUG] Still waiting... ({wait_count * 100}ms elapsed)")
+            
+            print(f"[DEBUG] Wait loop exited: _start_benchmark={self._start_benchmark}, _cancelled={self._cancelled}")
             
             if self._cancelled:
                 self.scenario.cleanup()
@@ -712,9 +727,24 @@ class SVOScenarioWorker(QThread):
                 else:
                     frames_empty_times.append(frame_time * 1000)
                 
+                # Prepare depth visualization data if we have detections
+                depth_data = None
+                if len(detections) > 0 and mean_depth > 0:
+                    # Get the first detection's bbox for visualization
+                    first_det = detections[0]
+                    if 'bbox' in first_det:
+                        # Get full depth array from result if available
+                        depth_array = result.get('depth_array', None)
+                        if depth_array is not None:
+                            bbox = first_det['bbox']  # [x1, y1, x2, y2]
+                            depth_data = DepthVisualizationData(
+                                depth_array=depth_array,
+                                bbox=tuple(bbox),
+                                mean_depth=mean_depth
+                            )
+                
                 # Update progress with detection info and component percentages
                 status = f"Frame {frames_processed}/{total_frames}"
-                depth_data = None  # TODO: Pass depth array and bbox for visualization
                 self.progress_updated.emit(frames_processed, total_frames, status, fps, len(detections), 
                                           mean_depth, component_percentages, depth_data)
             
@@ -1313,7 +1343,7 @@ class JetsonBenchmarkApp(QMainWindow):
         
         self.show_preview_check = QCheckBox("Show live preview")
         self.show_preview_check.setChecked(True)
-        self.show_preview_check.setEnabled(False)
+        self.show_preview_check.setEnabled(True)  # Always enabled - preview works without saving
         svo_options_layout.addWidget(self.show_preview_check)
         
         self.svo_options_group.setLayout(svo_options_layout)
@@ -1450,44 +1480,35 @@ class JetsonBenchmarkApp(QMainWindow):
         component_group.setLayout(component_layout)
         stats_layout.addWidget(component_group)
         
-        # Depth plot
+        # Depth visualization row (plot + heatmap side by side)
+        depth_viz_layout = QHBoxLayout()
+        
+        # Main depth plot (left side)
         self.depth_plot = DepthPlotCanvas()
         self.depth_plot.setMinimumHeight(200)
         self.depth_plot.setMaximumHeight(250)
-        stats_layout.addWidget(self.depth_plot)
+        depth_viz_layout.addWidget(self.depth_plot, stretch=3)
         
-        # Advanced depth visualizations (collapsible)
-        advanced_viz_group = QGroupBox("Advanced Depth Visualization")
+        # Depth heatmap viewer (right side, hidden by default)
+        self.depth_map_viewer = DepthMapViewer()
+        self.depth_map_viewer.setVisible(False)
+        self.depth_map_viewer.setMinimumHeight(200)
+        self.depth_map_viewer.setMaximumHeight(250)
+        depth_viz_layout.addWidget(self.depth_map_viewer, stretch=2)
+        
+        stats_layout.addLayout(depth_viz_layout)
+        
+        # Advanced depth visualizations (heatmap toggle only)
+        advanced_viz_group = QGroupBox("Depth Heatmap")
         advanced_viz_layout = QVBoxLayout()
         
-        # Toggle buttons
-        toggle_layout = QHBoxLayout()
-        
+        # Toggle button for heatmap only
         self.toggle_depthmap_btn = QPushButton("📊 Show Depth Heatmap")
         self.toggle_depthmap_btn.setCheckable(True)
         self.toggle_depthmap_btn.setChecked(False)
         self.toggle_depthmap_btn.setStyleSheet("font-size: 10px; padding: 5px;")
         self.toggle_depthmap_btn.clicked.connect(self._toggle_depth_heatmap)
-        toggle_layout.addWidget(self.toggle_depthmap_btn)
-        
-        self.toggle_timeplot_btn = QPushButton("📈 Show Time Chart")
-        self.toggle_timeplot_btn.setCheckable(True)
-        self.toggle_timeplot_btn.setChecked(False)
-        self.toggle_timeplot_btn.setStyleSheet("font-size: 10px; padding: 5px;")
-        self.toggle_timeplot_btn.clicked.connect(self._toggle_depth_timeplot)
-        toggle_layout.addWidget(self.toggle_timeplot_btn)
-        
-        advanced_viz_layout.addLayout(toggle_layout)
-        
-        # Depth heatmap viewer (hidden by default)
-        self.depth_map_viewer = DepthMapViewer()
-        self.depth_map_viewer.setVisible(False)
-        advanced_viz_layout.addWidget(self.depth_map_viewer)
-        
-        # Depth time plot (hidden by default)
-        self.depth_time_plot = DepthTimePlot()
-        self.depth_time_plot.setVisible(False)
-        advanced_viz_layout.addWidget(self.depth_time_plot)
+        advanced_viz_layout.addWidget(self.toggle_depthmap_btn)
         
         advanced_viz_group.setLayout(advanced_viz_layout)
         stats_layout.addWidget(advanced_viz_group)
@@ -1579,10 +1600,8 @@ class JetsonBenchmarkApp(QMainWindow):
             self.svo_info_label.setText("⚠ Invalid SVO2 file")
     
     def _on_save_images_toggled(self, checked: bool):
-        """Enable/disable preview option based on save images."""
-        self.show_preview_check.setEnabled(checked)
+        """Handle save images toggle."""
         if checked:
-            self.show_preview_check.setChecked(True)
             # Disable annotations-only when saving images
             if self.save_annotations_only_check.isChecked():
                 self.save_annotations_only_check.setChecked(False)
@@ -1593,8 +1612,7 @@ class JetsonBenchmarkApp(QMainWindow):
             # Disable save images when annotations-only is enabled
             if self.save_images_check.isChecked():
                 self.save_images_check.setChecked(False)
-            self.show_preview_check.setEnabled(False)
-            self.show_preview_check.setChecked(False)
+            # Preview still works without saving images!
     
     def _load_svo(self):
         """Initialize SVO2 file (loading phase)."""
@@ -1624,6 +1642,16 @@ class JetsonBenchmarkApp(QMainWindow):
         self.output_text.append(f"📁 Output: {run_folder}")
         self.output_text.append("\n⏳ Loading SVO2 file with NEURAL_PLUS depth...")
         self.output_text.append("   This can take 30-60 seconds for initialization...")
+        
+        # Clean up old worker if exists
+        if self.svo_worker is not None:
+            self.output_text.append("⚠️ Cleaning up previous SVO2 worker...")
+            self.svo_worker.cancel()
+            if self.svo_worker.scenario:
+                self.svo_worker.scenario.cleanup()
+            self.svo_worker.wait(2000)  # Wait up to 2 seconds
+            self.svo_worker = None
+            self.svo_loaded = False
         
         # Disable UI during loading
         self.svo_load_btn.setEnabled(False)
@@ -1696,10 +1724,9 @@ class JetsonBenchmarkApp(QMainWindow):
         
         # Clear advanced visualizations
         self.depth_map_viewer.clear()
-        self.depth_time_plot.clear()
         
-        # Connect preview if enabled
-        if self.save_images_check.isChecked() and self.show_preview_check.isChecked():
+        # Connect preview if enabled (works independently of saving images)
+        if self.show_preview_check.isChecked():
             self.svo_worker.frame_processed.connect(self._on_frame_preview)
         
         # Disable buttons during processing
@@ -1717,8 +1744,10 @@ class JetsonBenchmarkApp(QMainWindow):
         self.svo_worker.benchmark_complete.connect(self._on_svo_benchmark_complete)
         self.svo_worker.benchmark_failed.connect(self._on_svo_benchmark_failed)
         
-        # Emit signal to start benchmark phase in worker thread
-        self.svo_worker.start_processing.emit()
+        # Set flag directly instead of using signal (more reliable)
+        print("[DEBUG] GUI: Setting start flag directly...")
+        self.svo_worker._start_benchmark = True
+        print("[DEBUG] GUI: Start flag set")
     
     def _toggle_pause(self):
         """Toggle pause/resume state for benchmark."""
@@ -1758,9 +1787,13 @@ class JetsonBenchmarkApp(QMainWindow):
             # Request cancellation
             self.svo_worker.cancel()
             
-            # Disable control buttons
-            self.pause_btn.setEnabled(False)
-            self.stop_btn.setEnabled(False)
+            # Re-enable load and start buttons for next run
+            self.svo_load_btn.setEnabled(True)
+            self.svo_start_btn.setEnabled(True)
+            
+            # Hide control buttons
+            self.pause_btn.setVisible(False)
+            self.stop_btn.setVisible(False)
     
     def _toggle_depth_heatmap(self):
         """Toggle visibility of depth heatmap visualization."""
@@ -1774,19 +1807,6 @@ class JetsonBenchmarkApp(QMainWindow):
             self.toggle_depthmap_btn.setText("📊 Show Depth Heatmap")
             self.output_text.append("📊 Depth heatmap visualization disabled")
             self.depth_map_viewer.clear()
-    
-    def _toggle_depth_timeplot(self):
-        """Toggle visibility of depth time plot."""
-        is_checked = self.toggle_timeplot_btn.isChecked()
-        self.depth_time_plot.setVisible(is_checked)
-        
-        if is_checked:
-            self.toggle_timeplot_btn.setText("📈 Hide Time Chart")
-            self.output_text.append("📈 Depth time chart visualization enabled")
-        else:
-            self.toggle_timeplot_btn.setText("📈 Show Time Chart")
-            self.output_text.append("📈 Depth time chart visualization disabled")
-            self.depth_time_plot.clear()
     
     def _on_svo_progress(self, current: int, total: int, status: str, fps: float, num_objects: int, 
                          mean_depth: float, component_percentages: dict, depth_data: object):
@@ -1822,11 +1842,6 @@ class JetsonBenchmarkApp(QMainWindow):
             # Update depth heatmap if visible
             if self.toggle_depthmap_btn.isChecked() and self.depth_map_viewer.isVisible():
                 self.depth_map_viewer.update_depth_map(depth_data.depth_array, depth_data.bbox)
-            
-            # Update depth time plot if visible
-            if self.toggle_timeplot_btn.isChecked() and self.depth_time_plot.isVisible():
-                if mean_depth > 0:
-                    self.depth_time_plot.update_plot(mean_depth, current)
         
         # Log every 10 frames
         if current % 10 == 0:

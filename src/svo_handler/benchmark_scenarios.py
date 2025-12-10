@@ -484,12 +484,6 @@ class SVOPipelineScenario(BenchmarkScenario):
             cv2.imwrite(str(save_path), annotated_img)
             
             timings['save'] = (time.time() - save_start) * 1000
-            
-            # Send preview to GUI
-            if self.preview_callback:
-                # Convert to RGB for Qt display
-                preview_rgb = cv2.cvtColor(annotated_img, cv2.COLOR_BGR2RGB)
-                self.preview_callback(preview_rgb)
         
         elif self.save_annotations_only and self.output_dir:
             # Fast mode: Save only YOLO .txt annotations
@@ -525,7 +519,38 @@ class SVOPipelineScenario(BenchmarkScenario):
                 annotation_path.touch()
             
             timings['save'] = (time.time() - save_start) * 1000
-
+        
+        # Send preview to GUI (always, regardless of save mode or detections)
+        if self.preview_callback:
+            # Create annotated image for preview (show frame even if no detections)
+            preview_img = img_bgr.copy()
+            
+            # Draw detections if any
+            if detections:
+                for det in detections:
+                    x1, y1, x2, y2 = det['bbox']
+                    conf = det['confidence']
+                    depth = det['depth_mean']
+                    
+                    # Draw bbox
+                    color = (0, 255, 0) if det['class'] == 0 else (0, 0, 255)
+                    cv2.rectangle(preview_img, (x1, y1), (x2, y2), color, 2)
+                    
+                    # Draw label with confidence and depth
+                    if depth > 0:
+                        label = f"Conf:{conf:.2f} Depth:{depth:.2f}m"
+                    else:
+                        label = f"Conf:{conf:.2f} No depth"
+                    
+                    # Label background
+                    label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                    cv2.rectangle(preview_img, (x1, y1 - 20), (x1 + label_size[0], y1), color, -1)
+                    cv2.putText(preview_img, label, (x1, y1 - 5), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            # Convert to RGB for Qt display
+            preview_rgb = cv2.cvtColor(preview_img, cv2.COLOR_BGR2RGB)
+            self.preview_callback(preview_rgb)
         
         self.frame_index += 1
         
@@ -533,7 +558,8 @@ class SVOPipelineScenario(BenchmarkScenario):
             'detections': detections,
             'timings': timings,
             'frame_index': self.frame_index,
-            'total_frames': self.total_frames
+            'total_frames': self.total_frames,
+            'depth_array': depth_np  # Include full depth map for visualizations
         }
     
     def cleanup(self):
